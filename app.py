@@ -12,10 +12,13 @@ UI layout:
 from __future__ import annotations
 
 import io
+import sys
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.runtime as st_runtime
 
 from jooksuai.config import load_config
 from jooksuai.data import (
@@ -31,6 +34,12 @@ from jooksuai.llm import LLMNotAvailable, build_prompt, generate_recommendation
 from jooksuai.metrics import build_load_timeseries, summarize_load
 from jooksuai.rules import evaluate_safety_rules
 from jooksuai.ui import acwr_chart, daily_load_chart, rpe_trend_chart, weekly_volume_chart
+
+if __name__ == "__main__" and not st_runtime.exists():
+    from streamlit.web import cli as stcli
+
+    sys.argv = ["streamlit", "run", str(Path(__file__).resolve())]
+    raise SystemExit(stcli.main())
 
 st.set_page_config(page_title="jooksuai — treeningkoormuse analüüsija", page_icon="🏃", layout="wide")
 
