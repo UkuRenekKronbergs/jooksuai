@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Strava / Garmin tokens
+tokens/
+*.token
+.strava_token.json
+.garmin_token.json
+
+# Local data / cache
+*.sqlite
+*.sqlite3
+*.db
+data/cache/
+data/user/
+data/real_activities.csv
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Plaan artifacts (local working copy of plan)
+plaan.txt
+unpacked/
