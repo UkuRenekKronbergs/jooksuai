@@ -32,6 +32,7 @@ cd jooksuai
 python -m venv .venv
 source .venv/bin/activate           # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+pip install -e .                    # registreerib `jooksuai` paketi Pythoni teele
 
 # 3. (Valikuline) LLM ja Strava võtmed
 cp .env.example .env
