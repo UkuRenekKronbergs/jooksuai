@@ -38,7 +38,10 @@ pip install -e .                    # registreerib `jooksuai` paketi Pythoni tee
 cp .env.example .env
 # Sisesta oma ANTHROPIC_API_KEY (või OPENAI_API_KEY) .env-faili
 
-# 4. Käivita
+# 4. (Valikuline) Strava OAuth — üks kord, produceerib refresh_tokeni
+python scripts/strava_bootstrap.py
+
+# 5. Käivita
 streamlit run app.py
 ```
 
