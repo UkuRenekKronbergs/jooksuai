@@ -163,10 +163,14 @@ def _generate_openrouter(prompt: PromptBundle, config: Config) -> LLMRecommendat
             "X-Title": "jooksuai",
         },
     )
+    # We intentionally omit response_format here: OpenRouter proxies many open
+    # models (Gemma, Llama, etc) where strict JSON mode isn't supported. The
+    # prompt already instructs JSON-only output and _parse_json_with_retry
+    # retries once on parse failure — that combo beats getting a hard 400 from
+    # a model that doesn't speak OpenAI JSON mode.
     response = client.chat.completions.create(
         model=config.llm_model,
         temperature=config.llm_temperature,
-        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": prompt.system},
             {"role": "user", "content": prompt.user},
@@ -178,7 +182,6 @@ def _generate_openrouter(prompt: PromptBundle, config: Config) -> LLMRecommendat
         retry = client.chat.completions.create(
             model=config.llm_model,
             temperature=config.llm_temperature,
-            response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": prompt.system},
                 {"role": "user", "content": prompt.user},
