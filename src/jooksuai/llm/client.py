@@ -14,7 +14,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from ..config import Config
+from ..config import OPENROUTER_BASE_URL, Config
 from .prompts import PromptBundle
 
 
@@ -44,7 +44,7 @@ def generate_recommendation(prompt: PromptBundle, config: Config) -> LLMRecommen
     if not config.has_llm:
         raise LLMNotAvailable(
             f"No credentials for provider '{config.llm_provider}'. "
-            "Set ANTHROPIC_API_KEY or OPENAI_API_KEY in .env, "
+            "Set ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY in .env, "
             "or switch the UI to metrics-only mode."
         )
 
@@ -52,6 +52,8 @@ def generate_recommendation(prompt: PromptBundle, config: Config) -> LLMRecommen
         return _generate_anthropic(prompt, config)
     if config.llm_provider == "openai":
         return _generate_openai(prompt, config)
+    if config.llm_provider == "openrouter":
+        return _generate_openrouter(prompt, config)
     raise LLMNotAvailable(f"Unknown provider: {config.llm_provider}")
 
 
@@ -131,6 +133,68 @@ def _generate_openai(prompt: PromptBundle, config: Config) -> LLMRecommendation:
     )
     text = response.choices[0].message.content or ""
     parsed = _parse_json_with_retry(text, client, prompt, config, _generate_openai_retry)
+    usage = getattr(response, "usage", None)
+    return _build_recommendation(
+        parsed,
+        raw_text=text,
+        model=config.llm_model,
+        prompt_version=prompt.version,
+        input_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
+        output_tokens=getattr(usage, "completion_tokens", None) if usage else None,
+    )
+
+
+def _generate_openrouter(prompt: PromptBundle, config: Config) -> LLMRecommendation:
+    """OpenRouter via the OpenAI SDK (OpenRouter is API-compatible).
+
+    Handy because one key gives access to Claude, GPT, Llama, Gemini etc — the
+    model name is the `provider/model` slug on https://openrouter.ai/models.
+    """
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise LLMNotAvailable("openai SDK not installed — run `pip install openai`") from exc
+
+    client = OpenAI(
+        api_key=config.openrouter_api_key,
+        base_url=OPENROUTER_BASE_URL,
+        default_headers={
+            "HTTP-Referer": "https://github.com/UkuRenekKronbergs/jooksuai",
+            "X-Title": "jooksuai",
+        },
+    )
+    response = client.chat.completions.create(
+        model=config.llm_model,
+        temperature=config.llm_temperature,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": prompt.system},
+            {"role": "user", "content": prompt.user},
+        ],
+    )
+    text = response.choices[0].message.content or ""
+
+    def _retry(prompt: PromptBundle, config: Config, error: str) -> str:
+        retry = client.chat.completions.create(
+            model=config.llm_model,
+            temperature=config.llm_temperature,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt.system},
+                {"role": "user", "content": prompt.user},
+                {"role": "assistant", "content": "Vabandust, annan kehtiva JSON-i."},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Eelmine väljund ei parsitud ({error}). "
+                        "Palun anna AINULT kehtiv JSON, mis vastab skeemile."
+                    ),
+                },
+            ],
+        )
+        return retry.choices[0].message.content or ""
+
+    parsed = _parse_json_with_retry(text, client, prompt, config, _retry)
     usage = getattr(response, "usage", None)
     return _build_recommendation(
         parsed,
