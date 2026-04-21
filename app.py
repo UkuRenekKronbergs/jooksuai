@@ -32,6 +32,7 @@ from jooksuai.data.csv_loader import load_activities_csv
 from jooksuai.data.strava import StravaNotConfigured, fetch_recent_activities
 from jooksuai.llm import LLMNotAvailable, build_prompt, generate_recommendation
 from jooksuai.metrics import build_load_timeseries, summarize_load
+from jooksuai.planning import PlanGenerationError, PlanGoal, generate_training_plan
 from jooksuai.rules import evaluate_safety_rules
 from jooksuai.ui import acwr_chart, daily_load_chart, rpe_trend_chart, weekly_volume_chart
 
@@ -236,7 +237,9 @@ if not activities:
     st.info("Andmed pole veel laaditud. Vali vasakul andmeallikas või lae CSV.")
     st.stop()
 
-tab1, tab2, tab3 = st.tabs(["Tänane soovitus", "Koormuse ajalugu", "Retrospektiivne test"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["Tänane soovitus", "Koormuse ajalugu", "Retrospektiivne test", "Treeningkava"]
+)
 
 # --- Tab 1: today's recommendation
 with tab1:
@@ -413,3 +416,127 @@ with tab3:
 
             _render_safety_flags(retro_verdict)
             _render_verdict_box(retro_verdict, retro_llm)
+
+# --- Tab 4: training plan generator
+with tab4:
+    st.markdown(
+        "Genereeri **täielik päev-haaval treeningkava** võistluseks. Mudel arvestab sinu profiili, "
+        "tippaegu, praegust vormi (ACWR/monotoonsus) ja valitud sihtaega. Kulu ~€0.001–0.01 per plaan "
+        "sõltuvalt mudelist ja nädalate arvust."
+    )
+
+    if not cfg.has_llm:
+        st.warning("LLM pole seadistatud — plaani genereerimine vajab LLM-i. Lisa API võti .env-i.")
+    else:
+        col1, col2, col3 = st.columns(3)
+        event_name = col1.text_input("Võistluse nimi", value="Tallinna 10 km", key="plan_event")
+        distance_km = col2.number_input(
+            "Distants (km)", min_value=1.0, max_value=100.0, value=10.0, step=0.1, key="plan_distance"
+        )
+        event_date = col3.date_input(
+            "Võistluse kuupäev",
+            value=analysis_date + timedelta(weeks=10),
+            min_value=analysis_date + timedelta(weeks=1),
+            key="plan_event_date",
+        )
+
+        col4, col5 = st.columns(2)
+        target_min = col4.number_input(
+            "Sihtaeg (minutid)",
+            min_value=3.0, max_value=360.0, value=35.0, step=0.25,
+            help="Kokku minutites. Nt 34:40 = 34.67.",
+            key="plan_target_min",
+        )
+        plan_start_date = col5.date_input(
+            "Plaani algus",
+            value=analysis_date,
+            min_value=analysis_date,
+            max_value=event_date - timedelta(days=7),
+            key="plan_start",
+        )
+
+        weeks_between = (event_date - plan_start_date).days // 7
+        st.caption(f"Plaani pikkus: **{weeks_between} nädalat**, {weeks_between * 7} seansi-kirjet.")
+
+        if st.button("Genereeri treeningkava", type="primary", width="stretch", key="plan_generate"):
+            goal = PlanGoal(
+                event_name=event_name,
+                distance_km=float(distance_km),
+                target_time_minutes=float(target_min),
+                event_date=event_date,
+            )
+            summary_for_plan = summarize_load(activities, profile, as_of=analysis_date) if activities else None
+
+            with st.spinner(f"Genereerin {weeks_between}-nädalast kava ({cfg.llm_model})..."):
+                try:
+                    plan = generate_training_plan(
+                        profile=profile,
+                        goal=goal,
+                        summary=summary_for_plan,
+                        plan_start=plan_start_date,
+                        config=cfg,
+                    )
+                except (PlanGenerationError, LLMNotAvailable) as exc:
+                    st.error(f"Plaani genereerimine ebaõnnestus: {exc}")
+                    st.stop()
+                except Exception as exc:
+                    st.error(f"Ootamatu viga: {exc}")
+                    st.stop()
+
+            st.success(
+                f"Plaan valmis: {plan.total_weeks} nädalat, {len(plan.all_sessions)} seanssi "
+                f"(mudel: `{plan.model}`)"
+            )
+
+            if plan.overview:
+                st.markdown("### Ülevaade")
+                st.write(plan.overview)
+
+            st.markdown("### Nädalad")
+            for week in plan.weeks:
+                with st.expander(
+                    f"Nädal {week.week_number} ({week.week_start.isoformat()}) — "
+                    f"{week.phase.upper()}, siht {week.target_volume_km:.0f} km",
+                    expanded=(week.week_number == 1),
+                ):
+                    if week.notes:
+                        st.caption(week.notes)
+                    rows = [
+                        {
+                            "Kuupäev": s.session_date.isoformat(),
+                            "Nädalapäev": ["E", "T", "K", "N", "R", "L", "P"][s.session_date.weekday()],
+                            "Tüüp": s.session_type,
+                            "Tsoon": s.intensity_zone,
+                            "Kestus (min)": round(s.duration_min, 0),
+                            "km": round(s.distance_km, 1) if s.distance_km else "—",
+                            "Sihttempo": f"{s.target_pace_min_per_km:.2f}" if s.target_pace_min_per_km else "—",
+                            "Kirjeldus": s.description,
+                        }
+                        for s in week.sessions
+                    ]
+                    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+            st.markdown("### Eksport")
+            flat_rows = [
+                {
+                    "week_number": w.week_number,
+                    "week_start": w.week_start.isoformat(),
+                    "phase": w.phase,
+                    "session_date": s.session_date.isoformat(),
+                    "session_type": s.session_type,
+                    "duration_min": s.duration_min,
+                    "intensity_zone": s.intensity_zone,
+                    "target_pace_min_per_km": s.target_pace_min_per_km,
+                    "distance_km": s.distance_km,
+                    "description": s.description,
+                }
+                for w in plan.weeks
+                for s in w.sessions
+            ]
+            csv_bytes = pd.DataFrame(flat_rows).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Lae alla CSV-failina",
+                data=csv_bytes,
+                file_name=f"treeningkava_{goal.event_name.replace(' ', '_')}_{goal.event_date.isoformat()}.csv",
+                mime="text/csv",
+            )

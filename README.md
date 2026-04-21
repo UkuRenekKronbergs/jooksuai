@@ -15,11 +15,12 @@ Harrastus- ja poolprofessionaalsetel jooksjatel on palju andmeid (nutikell, GPS,
 ## Mis rakendus teeb
 
 - **Ostab endasse** viimase 60 päeva treeningud (Strava API / Strava-eksport CSV / lokaalne näidisandmestik).
-- **Arvutab** akuutne 7-päeva koormus, krooniline 28-päeva koormus, ACWR, Banisteri TRIMP, Fosteri monotoonsus ja strain.
+- **Arvutab** akuutne 7-päeva koormus, krooniline 28-päeva koormus, ACWR, Banisteri TRIMP, Fosteri monotoonsus ja strain. Pulsiandmete puudumisel kasutab tempo-põhist rTSS-stiilis fallback'i (künnis-tempo tuletub 10 km PB-st).
 - **Käivitab ohutusreeglid** — kui ACWR > 1.5, RPE ≥ 8 kaks päeva järjest, haigus või uni < 6 h, sunnitakse vastus ohutu kategooria suunas.
 - **Küsib LLM-ilt soovituse** neljas kategoorias (jätka / vähenda / taastumispäev / alternatiivne) koos 2–4-lauselise põhjendusega.
 - **Näitab** ACWR-kõverat, päevakoormust, nädalamahtu ja RPE-trendi Plotly-interaktiivgraafikutena.
 - **Retrospektiivne test** — vali mineviku kuupäev, näita mudeli soovitust nii, nagu see päev oleks olnud täna.
+- **Treeningkava** — genereerib täieliku päev-haaval struktureeritud võistluse-ettevalmistuse kava (base → build → peak → taper), arvestades sinu praegust vormi ja tippaegu. CSV-eksport TrainingPeaksi-sõbralik.
 
 ## Kiire alustamine
 
@@ -77,12 +78,16 @@ src/jooksuai/
 │   ├── csv_loader.py   # Natiivne + Strava-eksport parser
 │   └── sample.py       # Deterministlik näidisgeneraator
 ├── metrics/
-│   └── load.py         # TRIMP, ACWR, monotoonsus, strain
+│   └── load.py         # TRIMP, ACWR, monotoonsus, strain (HR + pace fallback)
 ├── rules/
 │   └── safety.py       # Reeglipõhised ohutusfiltrid (Plan B3)
 ├── llm/
-│   ├── prompts.py      # Eestikeelne prompt + few-shot näited
-│   └── client.py       # Anthropic + OpenAI taustakliendid
+│   ├── prompts.py      # Igapäevane prompt + few-shot näited
+│   └── client.py       # Anthropic + OpenAI + OpenRouter taustakliendid
+├── planning/
+│   ├── models.py       # PlanGoal, PlannedSession, WeekPlan, TrainingPlan
+│   ├── prompts.py      # Treeningkava prompt + JSON skeem
+│   └── generator.py    # LLM orkestreerimine, tolerantne parser
 └── ui/
     └── charts.py       # Plotly graafikud
 app.py                  # Streamlit entry point
