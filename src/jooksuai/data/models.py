@@ -50,7 +50,48 @@ class AthleteProfile:
     training_years: int
     season_goal: str = ""
     personal_bests: dict[str, str] = field(default_factory=dict)
+    # Manually-set threshold pace (1-hour sustainable). If None, derived from PBs.
+    threshold_pace_min_per_km: float | None = None
 
     @property
     def hr_reserve(self) -> int:
         return max(self.max_hr - self.resting_hr, 1)
+
+    @property
+    def effective_threshold_pace(self) -> float | None:
+        """Threshold (~1-hour-sustainable) pace in min/km.
+
+        Falls back to PB-derived estimate when not explicitly set:
+        - 10 km PB pace × 1.03 (threshold ≈ 3% slower than 10K race pace)
+        - else 5 km PB pace × 1.07 (threshold ≈ 7% slower than 5K race pace)
+
+        Used by metrics.load.trimp() as an HR-less fallback.
+        """
+        if self.threshold_pace_min_per_km:
+            return self.threshold_pace_min_per_km
+        for distance_key, multiplier in (("10000m", 1.03), ("5000m", 1.07), ("3000m", 1.10)):
+            pb = self.personal_bests.get(distance_key)
+            if not pb:
+                continue
+            pace = _parse_pb_to_pace_per_km(pb, _distance_meters(distance_key))
+            if pace:
+                return round(pace * multiplier, 3)
+        return None
+
+
+def _distance_meters(key: str) -> int:
+    return {"1500m": 1500, "3000m": 3000, "5000m": 5000, "10000m": 10000}.get(key, 0)
+
+
+def _parse_pb_to_pace_per_km(pb: str, distance_m: int) -> float | None:
+    """Parse a `M:SS` or `MM:SS` PB string into average pace (min/km)."""
+    if not pb or distance_m <= 0:
+        return None
+    try:
+        parts = pb.strip().split(":")
+        if len(parts) != 2:
+            return None
+        total_min = int(parts[0]) + int(parts[1]) / 60.0
+        return total_min / (distance_m / 1000.0)
+    except (TypeError, ValueError):
+        return None

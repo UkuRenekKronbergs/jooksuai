@@ -19,17 +19,21 @@ _NATIVE_COLUMNS = {
     "id", "activity_date", "activity_type", "distance_km", "duration_min",
 }
 
+# Strava bulk-export tends to duplicate columns (pandas suffixes them with .1):
+# the first batch is human-formatted, the second is raw units. We prefer the
+# second when available (raw m, m/s, sec). The renamer below reflects that.
 _STRAVA_RENAME = {
     "Activity ID": "id",
     "Activity Date": "activity_date",
     "Activity Type": "activity_type",
     "Distance": "distance_km",
     "Elapsed Time": "duration_sec",
-    "Moving Time": "duration_min_maybe_sec",
+    "Moving Time": "moving_time_sec",
     "Average Heart Rate": "avg_hr",
     "Max Heart Rate": "max_hr_observed",
     "Elevation Gain": "elevation_gain_m",
     "Activity Name": "notes",
+    "Average Speed": "avg_speed_mps",
 }
 
 
@@ -67,11 +71,11 @@ def _parse_strava(df: pd.DataFrame) -> list[TrainingActivity]:
     for row in renamed.to_dict(orient="records"):
         if "id" not in row or pd.isna(row["id"]):
             continue
-        distance_val = row.get("distance_km")
-        # Strava export uses meters when Distance column lacks units; detect > 500 = meters.
-        distance_km = float(distance_val) / 1000 if distance_val and float(distance_val) > 500 else float(distance_val or 0)
-        duration_sec = row.get("duration_sec")
-        duration_min = float(duration_sec) / 60 if duration_sec else 0.0
+
+        distance_km = _resolve_distance_km(row)
+        duration_min = _resolve_duration_min(row)
+        avg_pace = _resolve_pace_min_per_km(row, distance_km, duration_min)
+
         records.append(
             TrainingActivity(
                 id=str(row["id"]),
@@ -81,11 +85,63 @@ def _parse_strava(df: pd.DataFrame) -> list[TrainingActivity]:
                 duration_min=duration_min,
                 avg_hr=_opt_int(row.get("avg_hr")),
                 max_hr_observed=_opt_int(row.get("max_hr_observed")),
+                avg_pace_min_per_km=avg_pace,
                 elevation_gain_m=_opt_float(row.get("elevation_gain_m")),
                 notes=_opt_str(row.get("notes")),
             )
         )
     return records
+
+
+def _resolve_distance_km(row: dict) -> float:
+    """Pick distance from Strava's duplicated Distance / Distance.1 columns.
+
+    Bulk-export emits Distance (km) AND Distance.1 (m); some accounts emit only
+    one. Detect by magnitude — values > 500 are metres.
+    """
+    for key in ("distance_km", "Distance.1"):
+        val = row.get(key)
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            continue
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            continue
+        if f <= 0:
+            continue
+        return f / 1000 if f > 500 else f
+    return 0.0
+
+
+def _resolve_duration_min(row: dict) -> float:
+    """Prefer Moving Time over Elapsed Time — load shouldn't count café stops."""
+    for key in ("moving_time_sec", "duration_sec", "Elapsed Time.1"):
+        val = row.get(key)
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            continue
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            continue
+        if f > 0:
+            return f / 60.0
+    return 0.0
+
+
+def _resolve_pace_min_per_km(row: dict, distance_km: float, duration_min: float) -> float | None:
+    """Average pace in min/km. Try `Average Speed` (m/s) first, else compute."""
+    speed = row.get("avg_speed_mps")
+    if speed is not None and not (isinstance(speed, float) and pd.isna(speed)):
+        try:
+            f = float(speed)
+            if f > 0:
+                # min/km = (1000 / m_per_s) / 60
+                return round((1000.0 / f) / 60.0, 3)
+        except (TypeError, ValueError):
+            pass
+    if distance_km > 0 and duration_min > 0:
+        return round(duration_min / distance_km, 3)
+    return None
 
 
 def write_activities_csv(activities: Iterable[TrainingActivity], destination: str | Path) -> None:

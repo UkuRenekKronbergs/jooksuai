@@ -83,6 +83,32 @@ def _render_profile_editor(default: AthleteProfile) -> AthleteProfile:
         max_hr = col4.number_input("Maksimaalne pulss", min_value=120, max_value=230, value=default.max_hr)
         rest_hr = col5.number_input("Puhkepulss", min_value=30, max_value=90, value=default.resting_hr)
         goal = st.text_input("Hooaja eesmärk", value=default.season_goal)
+
+        st.markdown("**Tippajad** (formaadis `M:SS` või `MM:SS`)")
+        pb_cols = st.columns(4)
+        pbs: dict[str, str] = {}
+        for col, key, label in zip(
+            pb_cols,
+            ("1500m", "3000m", "5000m", "10000m"),
+            ("1500 m", "3000 m", "5000 m", "10 000 m"),
+            strict=False,
+        ):
+            v = col.text_input(label, value=default.personal_bests.get(key, ""), key=f"pb_{key}")
+            if v.strip():
+                pbs[key] = v.strip()
+
+        st.markdown("**Künnis-tempo** (jäta 0, et tuletada 10 km PB-st automaatselt)")
+        threshold_input = st.number_input(
+            "min/km",
+            min_value=0.0,
+            max_value=10.0,
+            value=default.threshold_pace_min_per_km or 0.0,
+            step=0.05,
+            format="%.2f",
+            help="HR-andmete puudumisel kasutatakse seda intensity factor'i arvutamiseks (rTSS-stiilis fallback).",
+        )
+        threshold_value = threshold_input if threshold_input > 0 else None
+
     return AthleteProfile(
         name=name,
         age=int(age),
@@ -91,7 +117,8 @@ def _render_profile_editor(default: AthleteProfile) -> AthleteProfile:
         resting_hr=int(rest_hr),
         training_years=int(years),
         season_goal=goal,
-        personal_bests=default.personal_bests,
+        personal_bests=pbs or default.personal_bests,
+        threshold_pace_min_per_km=threshold_value,
     )
 
 
@@ -230,6 +257,21 @@ with tab1:
         f"{summary.monotony:.2f}" if summary.monotony is not None else "—",
         help="Foster monotony = 7-päeva mean / std. ≥ 2.0 = vähe varieeruvust.",
     )
+
+    hr_coverage = sum(1 for a in activities if a.avg_hr) / max(len(activities), 1)
+    if hr_coverage < 0.5:
+        threshold = profile.effective_threshold_pace
+        if threshold:
+            st.info(
+                f"Pulsiandmeid ainult {hr_coverage * 100:.0f}%-l treeningutest. "
+                f"Kasutan tempo-põhist fallback'i (rTSS-stiilis), threshold-tempo **{threshold:.2f} min/km**. "
+                f"Sea profiilis täpselt või lisa 10 km PB."
+            )
+        else:
+            st.warning(
+                f"Pulsiandmeid ainult {hr_coverage * 100:.0f}%-l treeningutest ja künnis-tempo pole määratud. "
+                f"Koormus arvutub 0-ks. Lisa profiili threshold-tempo või 10 km PB."
+            )
 
     st.divider()
 

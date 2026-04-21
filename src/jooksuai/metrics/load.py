@@ -42,29 +42,55 @@ def trimp(
     max_hr: int,
     sex: str = "M",
     fallback_rpe: int | None = None,
+    fallback_pace_min_per_km: float | None = None,
+    threshold_pace_min_per_km: float | None = None,
 ) -> float:
-    """Banister TRIMP for a single session.
+    """Single-session training load.
 
-    If `avg_hr` is missing, falls back to session-RPE (Foster 2001): duration × RPE.
-    That's less precise but keeps the timeline continuous for runs logged without HR.
+    Resolution order — uses the most accurate signal available:
+
+    1. **HR-based Banister TRIMP** (preferred): needs `avg_hr` plus rest/max HR.
+    2. **Pace-based rTSS-style** (Coggan/Daniels): needs `fallback_pace_min_per_km`
+       *and* `threshold_pace_min_per_km`. Returns ``duration_min × IF²`` where
+       ``IF = threshold_pace / actual_pace`` clamped to [0.4, 1.4]. At threshold
+       (IF=1.0) for 60 min this yields 60, comparable in magnitude to a tempo-
+       intensity Banister TRIMP — so the two can mix in the same daily series.
+    3. **Session-RPE** (Foster 2001): ``duration × RPE``.
+    4. **Zero**: nothing usable.
+
+    Mixed sessions in the same series degrade comparability slightly but ACWR is
+    a *ratio* — units cancel — so trends remain meaningful.
     """
     if duration_min <= 0:
         return 0.0
 
-    if avg_hr is None or avg_hr <= 0:
-        if fallback_rpe is not None and fallback_rpe > 0:
-            return duration_min * fallback_rpe * RPE_FALLBACK_MULTIPLIER
-        return 0.0
+    # 1. HR-based Banister
+    if avg_hr is not None and avg_hr > 0:
+        reserve = max(max_hr - resting_hr, 1)
+        hr_ratio = (avg_hr - resting_hr) / reserve
+        hr_ratio = max(0.0, min(hr_ratio, 1.0))
+        if sex.upper() == "F":
+            weight = 0.86 * math.exp(1.67 * hr_ratio)
+        else:
+            weight = 0.64 * math.exp(1.92 * hr_ratio)
+        return duration_min * hr_ratio * weight
 
-    reserve = max(max_hr - resting_hr, 1)
-    hr_ratio = (avg_hr - resting_hr) / reserve
-    hr_ratio = max(0.0, min(hr_ratio, 1.0))
+    # 2. Pace-based rTSS-style (HR-less fallback)
+    if (
+        fallback_pace_min_per_km
+        and fallback_pace_min_per_km > 0
+        and threshold_pace_min_per_km
+        and threshold_pace_min_per_km > 0
+    ):
+        intensity = threshold_pace_min_per_km / max(fallback_pace_min_per_km, 0.1)
+        intensity = max(0.4, min(intensity, 1.4))
+        return duration_min * intensity**2
 
-    if sex.upper() == "F":
-        weight = 0.86 * math.exp(1.67 * hr_ratio)
-    else:
-        weight = 0.64 * math.exp(1.92 * hr_ratio)
-    return duration_min * hr_ratio * weight
+    # 3. Session-RPE
+    if fallback_rpe is not None and fallback_rpe > 0:
+        return duration_min * fallback_rpe * RPE_FALLBACK_MULTIPLIER
+
+    return 0.0
 
 
 def build_load_timeseries(
@@ -84,6 +110,7 @@ def build_load_timeseries(
     if not items:
         return pd.Series(dtype=float, name="daily_load")
 
+    threshold_pace = profile.effective_threshold_pace
     rows = [
         {
             "activity_date": a.activity_date,
@@ -94,6 +121,8 @@ def build_load_timeseries(
                 max_hr=profile.max_hr,
                 sex=profile.sex,
                 fallback_rpe=a.rpe,
+                fallback_pace_min_per_km=a.avg_pace_min_per_km,
+                threshold_pace_min_per_km=threshold_pace,
             ),
         }
         for a in items

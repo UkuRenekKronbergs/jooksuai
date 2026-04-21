@@ -54,6 +54,49 @@ def test_trimp_returns_zero_when_hr_and_rpe_missing():
     assert trimp(45, None, 50, 190) == 0.0
 
 
+def test_trimp_pace_fallback_at_threshold_returns_duration():
+    # Pace == threshold → IF = 1.0 → load = duration × 1² = duration
+    value = trimp(
+        duration_min=60, avg_hr=None, resting_hr=50, max_hr=190,
+        fallback_pace_min_per_km=3.5, threshold_pace_min_per_km=3.5,
+    )
+    assert math.isclose(value, 60.0)
+
+
+def test_trimp_pace_fallback_faster_than_threshold_higher_load():
+    # 20% faster than threshold → IF = 1.2 → load = duration × 1.44
+    value = trimp(
+        duration_min=30, avg_hr=None, resting_hr=50, max_hr=190,
+        fallback_pace_min_per_km=2.92, threshold_pace_min_per_km=3.5,
+    )
+    assert math.isclose(value, 30 * (3.5 / 2.92) ** 2, rel_tol=1e-3)
+
+
+def test_trimp_pace_fallback_slower_than_threshold_lower_load():
+    # Easy pace 5:00/km against threshold 3:30/km → IF = 0.7 → load = duration × 0.49
+    value = trimp(
+        duration_min=60, avg_hr=None, resting_hr=50, max_hr=190,
+        fallback_pace_min_per_km=5.0, threshold_pace_min_per_km=3.5,
+    )
+    assert math.isclose(value, 60 * (3.5 / 5.0) ** 2, rel_tol=1e-3)
+
+
+def test_trimp_hr_takes_priority_over_pace():
+    # When both HR and pace are available, HR wins (more accurate).
+    hr_value = trimp(60, 150, 50, 190, fallback_pace_min_per_km=5.0, threshold_pace_min_per_km=3.5)
+    pace_only = trimp(60, None, 50, 190, fallback_pace_min_per_km=5.0, threshold_pace_min_per_km=3.5)
+    assert hr_value != pytest.approx(pace_only)
+
+
+def test_trimp_pace_fallback_without_threshold_falls_through_to_rpe():
+    value = trimp(
+        duration_min=45, avg_hr=None, resting_hr=50, max_hr=190,
+        fallback_pace_min_per_km=4.0, threshold_pace_min_per_km=None,
+        fallback_rpe=6,
+    )
+    assert value == 45 * 6
+
+
 def test_trimp_clamps_hr_above_max():
     # avg_hr above max shouldn't explode — hr_ratio clamped to 1.0
     extreme = trimp(30, 250, 50, 190, sex="M")
@@ -68,7 +111,8 @@ def test_build_load_timeseries_fills_rest_days(profile, today):
         TrainingActivity(id="a1", activity_date=today - timedelta(days=2), activity_type="Run", distance_km=10, duration_min=50, avg_hr=140),
         TrainingActivity(id="a2", activity_date=today, activity_type="Run", distance_km=8, duration_min=40, avg_hr=150),
     ]
-    series = build_load_timeseries(activities, profile)
+    # Pin `end` so the test isn't dependent on real wall-clock today.
+    series = build_load_timeseries(activities, profile, end=today)
     # Should include today-2, today-1 (rest), today
     assert len(series) == 3
     assert series.iloc[1] == 0.0  # rest day
@@ -81,10 +125,10 @@ def test_build_load_timeseries_empty_returns_empty(profile):
 
 # --- ACWR -----------------------------------------------------------------
 
-def test_acwr_flat_load_converges_to_one(profile, easy_run_factory):
+def test_acwr_flat_load_converges_to_one(profile, easy_run_factory, today):
     # 40 days of identical easy runs → acute mean == chronic mean → ACWR == 1.0
     activities = easy_run_factory(days=40)
-    series = build_load_timeseries(activities, profile)
+    series = build_load_timeseries(activities, profile, end=today)
     ratios = acwr_series(series)
     assert math.isclose(ratios["acwr"].iloc[-1], 1.0, abs_tol=0.01)
 
@@ -116,10 +160,10 @@ def test_acwr_empty_returns_empty_df(profile):
 
 # --- Monotony -------------------------------------------------------------
 
-def test_monotony_zero_variance_returns_none(profile, easy_run_factory):
+def test_monotony_zero_variance_returns_none(profile, easy_run_factory, today):
     # Identical loads every day → std = 0 → monotony undefined
     activities = easy_run_factory(days=7, avg_hr=140, duration_min=45)
-    series = build_load_timeseries(activities, profile)
+    series = build_load_timeseries(activities, profile, end=today)
     assert compute_monotony(series) is None
 
 

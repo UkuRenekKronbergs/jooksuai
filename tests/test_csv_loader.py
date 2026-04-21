@@ -39,3 +39,20 @@ def test_strava_csv_converts_meters_and_seconds():
     assert activities[0].duration_min == 48.5
     assert activities[0].avg_hr == 148
     assert activities[0].notes == "Morning Run"
+    # Pace derived from distance/duration when Average Speed missing: 48.5/10.5 ≈ 4.619
+    assert activities[0].avg_pace_min_per_km == 4.619
+
+
+STRAVA_CSV_WITH_SPEED = """\
+Activity ID,Activity Date,Activity Type,Distance,Moving Time,Average Speed,Elevation Gain,Activity Name
+99,"Apr 21, 2026, 07:00:00 AM",Run,10000,2400,4.1667,30,Speed test
+"""
+
+
+def test_strava_csv_derives_pace_from_average_speed():
+    activities = load_activities_csv(StringIO(STRAVA_CSV_WITH_SPEED))
+    assert len(activities) == 1
+    # 4.1667 m/s → (1000/4.1667)/60 = 4.0 min/km
+    assert activities[0].avg_pace_min_per_km == 4.0
+    # Moving Time preferred over Elapsed Time: 2400 / 60 = 40 min
+    assert activities[0].duration_min == 40.0
