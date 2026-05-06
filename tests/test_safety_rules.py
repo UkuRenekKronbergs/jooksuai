@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from jooksuai.data.models import DailySubjective, TrainingActivity
-from jooksuai.metrics.load import summarize_load
-from jooksuai.rules.safety import (
+from vorm.data.models import DailySubjective, TrainingActivity
+from vorm.metrics.load import summarize_load
+from vorm.rules.safety import (
     Recommendation,
     evaluate_safety_rules,
 )

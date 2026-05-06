@@ -3,7 +3,7 @@
 **AI-põhine treeningkoormuse analüüsija kesk- ja pikamaajooksjatele**
 
 **Autor:** Uku Renek Kronbergs
-**Ainekood:** Tehisintellekti rakendamine (TalTech, kevad 2026)
+**Ainekood:** Tehisintellekti rakendamine (Tartu Ülikool, kevad 2026)
 **Projekti vorm:** üksi — kõik rollid (projektijuht, AI-insener, andmeinsener, UI-arendaja, kasutaja ja valideerija) on minu kanda
 
 ---

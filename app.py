@@ -1,4 +1,4 @@
-"""Streamlit entry point for jooksuai.
+"""Streamlit entry point for Vorm.ai.
 
 Run with: ``streamlit run app.py``
 
@@ -20,26 +20,26 @@ import pandas as pd
 import streamlit as st
 import streamlit.runtime as st_runtime
 
-from jooksuai.config import load_config
-from jooksuai.data import (
+from vorm.config import load_config
+from vorm.data import (
     AthleteProfile,
     DailySubjective,
     TrainingActivity,
     generate_sample_activities,
     load_sample_profile,
 )
-from jooksuai.data.csv_loader import load_activities_csv
-from jooksuai.data.strava import StravaNotConfigured, fetch_recent_activities
-from jooksuai.llm import LLMNotAvailable, build_prompt, generate_recommendation
-from jooksuai.metrics import (
+from vorm.data.csv_loader import load_activities_csv
+from vorm.data.strava import StravaNotConfigured, fetch_recent_activities
+from vorm.llm import LLMNotAvailable, build_prompt, generate_recommendation
+from vorm.metrics import (
     PB_DISTANCES,
     build_load_timeseries,
     find_personal_bests,
     summarize_load,
 )
-from jooksuai.planning import PlanGenerationError, PlanGoal, generate_training_plan
-from jooksuai.rules import evaluate_safety_rules
-from jooksuai.ui import (
+from vorm.planning import PlanGenerationError, PlanGoal, generate_training_plan
+from vorm.rules import evaluate_safety_rules
+from vorm.ui import (
     acwr_chart,
     daily_load_chart,
     fitness_form_chart,
@@ -54,7 +54,7 @@ if __name__ == "__main__" and not st_runtime.exists():
     sys.argv = ["streamlit", "run", str(Path(__file__).resolve())]
     raise SystemExit(stcli.main())
 
-st.set_page_config(page_title="jooksuai — treeningkoormuse analüüsija", page_icon="🏃", layout="wide")
+st.set_page_config(page_title="Vorm.ai — treeningkoormuse analüüsija", page_icon="🏃", layout="wide")
 
 
 def _get_activities(source: str, uploaded_csv, days: int, cfg) -> list[TrainingActivity]:
@@ -255,7 +255,7 @@ def _summary_table(activities: list[TrainingActivity], today: date) -> pd.DataFr
 # --- Sidebar --------------------------------------------------------------
 cfg = load_config()
 
-st.sidebar.title("🏃 jooksuai")
+st.sidebar.title("🏃 Vorm.ai")
 st.sidebar.caption("AI-põhine treeningkoormuse analüüsija")
 
 data_source_options = ["Näidisandmed", "CSV-fail"]

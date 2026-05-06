@@ -158,8 +158,8 @@ def _generate_openrouter(prompt: PromptBundle, config: Config) -> LLMRecommendat
         api_key=config.openrouter_api_key,
         base_url=OPENROUTER_BASE_URL,
         default_headers={
-            "HTTP-Referer": "https://github.com/UkuRenekKronbergs/jooksuai",
-            "X-Title": "jooksuai",
+            "HTTP-Referer": "https://github.com/UkuRenekKronbergs/vorm",
+            "X-Title": "Vorm.ai",
         },
     )
     # We intentionally omit response_format here: OpenRouter proxies many open

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date
 from io import StringIO
 
-from jooksuai.data.csv_loader import load_activities_csv
+from vorm.data.csv_loader import load_activities_csv
 
 NATIVE_CSV = """\
 id,activity_date,activity_type,distance_km,duration_min,avg_hr,rpe,notes

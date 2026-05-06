@@ -11,8 +11,8 @@ from datetime import date, datetime
 
 import pytest
 
-from jooksuai.planning.generator import _plan_from_json
-from jooksuai.planning.models import PlanGoal, PlannedSession, TrainingPlan, WeekPlan
+from vorm.planning.generator import _plan_from_json
+from vorm.planning.models import PlanGoal, PlannedSession, TrainingPlan, WeekPlan
 
 
 @pytest.fixture

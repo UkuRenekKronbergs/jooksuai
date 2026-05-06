@@ -5,8 +5,8 @@ from __future__ import annotations
 import math
 from datetime import date
 
-from jooksuai.data.models import TrainingActivity
-from jooksuai.metrics.personal_bests import (
+from vorm.data.models import TrainingActivity
+from vorm.metrics.personal_bests import (
     PersonalBest,
     find_personal_bests,
     progression_at_distance,

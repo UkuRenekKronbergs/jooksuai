@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from jooksuai.data.models import AthleteProfile
+from vorm.data.models import AthleteProfile
 
 
 def _profile(**overrides) -> AthleteProfile:

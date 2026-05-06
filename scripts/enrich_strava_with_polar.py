@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from jooksuai.data.polar import enrich_strava_csv
+from vorm.data.polar import enrich_strava_csv
 
 
 def main() -> int:

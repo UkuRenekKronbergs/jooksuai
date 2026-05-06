@@ -6,7 +6,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from jooksuai.data.models import AthleteProfile, TrainingActivity
+from vorm.data.models import AthleteProfile, TrainingActivity
 
 
 @pytest.fixture

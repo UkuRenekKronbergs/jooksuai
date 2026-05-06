@@ -114,8 +114,8 @@ def _call_openai_compatible(system: str, user: str, config: Config) -> str:
         client_kwargs["api_key"] = config.openrouter_api_key
         client_kwargs["base_url"] = OPENROUTER_BASE_URL
         client_kwargs["default_headers"] = {
-            "HTTP-Referer": "https://github.com/UkuRenekKronbergs/jooksuai",
-            "X-Title": "jooksuai",
+            "HTTP-Referer": "https://github.com/UkuRenekKronbergs/vorm",
+            "X-Title": "Vorm.ai",
         }
     else:
         client_kwargs["api_key"] = config.openai_api_key

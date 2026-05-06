@@ -11,8 +11,8 @@ from datetime import timedelta
 
 import pytest
 
-from jooksuai.data.models import TrainingActivity
-from jooksuai.metrics.load import (
+from vorm.data.models import TrainingActivity
+from vorm.metrics.load import (
     ACWR_DANGER_HIGH,
     ACWR_SWEET_SPOT,
     acwr_series,

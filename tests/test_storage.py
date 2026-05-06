@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import date
 
-from jooksuai.data.models import AthleteProfile, TrainingActivity
-from jooksuai.data.storage import ActivityStore
+from vorm.data.models import AthleteProfile, TrainingActivity
+from vorm.data.storage import ActivityStore
 
 
 def test_profile_roundtrip_preserves_threshold_pace(tmp_path):

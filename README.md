@@ -1,16 +1,16 @@
-# jooksuai
+# Vorm.ai
 
 **AI-põhine treeningkoormuse analüüsija kesk- ja pikamaajooksjatele.**
 
-Tööriist võtab sisse sinu viimased treeningud (Strava / Garmini CSV / näidisandmed), arvutab spordimeditsiinilised koormusnäitajad (ACWR, TRIMP, monotoonsus), käivitab ohutusreeglite filtrid ja küsib suurest keelemudelist (Claude või GPT) konkreetse soovituse tänase treeningu kohta koos loomuliku keele põhjendusega.
+Tööriist võtab sisse sinu viimased treeningud (Strava / Garmini CSV / Polari JSON-eksport / näidisandmed), arvutab spordimeditsiinilised koormusnäitajad (TRIMP, ACWR, Banister CTL/ATL/TSB, monotoonsus), käivitab ohutusreeglite filtrid, tuvastab tippajad ja küsib suurest keelemudelist konkreetse soovituse tänase treeningu kohta koos loomuliku keele põhjendusega.
 
-Projekt valmib Tallinna Tehnikaülikooli *Tehisintellekti rakendamine*-aine raames kevadel 2026. Autor: Uku Renek Kronbergs.
+Projekt valmib Tartu Ülikooli *Tehisintellekti rakendamine*-aine raames kevadel 2026. Autor: Uku Renek Kronbergs.
 
 ---
 
 ## Miks seda on vaja
 
-Harrastus- ja poolprofessionaalsetel jooksjatel on palju andmeid (nutikell, GPS, pulss, uni), aga vähe aega neid struktureeritult analüüsida. Olemasolevad tööriistad annavad kas ainult numbreid (Garmin Training Readiness) või maksavad palju ja eeldavad treeneri-tasemel tõlgendusoskust (TrainingPeaks). `jooksuai` annab **andmepõhise teise arvamuse** tänase planeeritud treeningu kohta — kas seda peaks jätkama, vähendama, asendama või vahele jätma — koos inimkeele põhjendusega, mis viitab konkreetsetele numbritele.
+Harrastus- ja poolprofessionaalsetel jooksjatel on palju andmeid (nutikell, GPS, pulss, uni), aga vähe aega neid struktureeritult analüüsida. Olemasolevad tööriistad annavad kas ainult numbreid (Garmin Training Readiness) või maksavad palju ja eeldavad treeneri-tasemel tõlgendusoskust (TrainingPeaks). **Vorm.ai** annab **andmepõhise teise arvamuse** tänase planeeritud treeningu kohta — kas seda peaks jätkama, vähendama, asendama või vahele jätma — koos inimkeele põhjendusega, mis viitab konkreetsetele numbritele.
 
 ## Mis rakendus teeb
 
@@ -26,14 +26,14 @@ Harrastus- ja poolprofessionaalsetel jooksjatel on palju andmeid (nutikell, GPS,
 
 ```bash
 # 1. Kloonige
-git clone https://github.com/ukurenek/jooksuai.git
-cd jooksuai
+git clone https://github.com/UkuRenekKronbergs/vorm.git
+cd vorm
 
 # 2. Virtual environment + sõltuvused
 python -m venv .venv
 source .venv/bin/activate           # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-pip install -e .                    # registreerib `jooksuai` paketi Pythoni teele
+pip install -e .                    # registreerib `vorm` paketi Pythoni teele
 
 # 3. (Valikuline) LLM ja Strava võtmed
 cp .env.example .env
@@ -69,28 +69,33 @@ Rakendus tuvastab formaadi veergude järgi automaatselt.
 ## Arhitektuur
 
 ```
-src/jooksuai/
-├── config.py           # env-põhine konfiguratsioon (Config dataclass)
+src/vorm/
+├── config.py                # env-põhine konfiguratsioon (Config dataclass)
 ├── data/
-│   ├── models.py       # TrainingActivity, AthleteProfile, DailySubjective
-│   ├── storage.py      # SQLite vahemälu
-│   ├── strava.py       # stravalib-põhine OAuth-klient
-│   ├── csv_loader.py   # Natiivne + Strava-eksport parser
-│   └── sample.py       # Deterministlik näidisgeneraator
+│   ├── models.py            # TrainingActivity, AthleteProfile, DailySubjective
+│   ├── storage.py           # SQLite vahemälu
+│   ├── strava.py            # stravalib-põhine OAuth-klient
+│   ├── csv_loader.py        # Natiivne + Strava-eksport parser
+│   ├── polar.py             # Polar Flow JSON → Strava HR-täiendus
+│   └── sample.py            # Deterministlik näidisgeneraator
 ├── metrics/
-│   └── load.py         # TRIMP, ACWR, monotoonsus, strain (HR + pace fallback)
+│   ├── load.py              # TRIMP, ACWR, monotoonsus, Banister CTL/ATL/TSB, RPE-süntees
+│   └── personal_bests.py    # Tippajad standard-distantsidele
 ├── rules/
-│   └── safety.py       # Reeglipõhised ohutusfiltrid (Plan B3)
+│   └── safety.py            # Reeglipõhised ohutusfiltrid
 ├── llm/
-│   ├── prompts.py      # Igapäevane prompt + few-shot näited
-│   └── client.py       # Anthropic + OpenAI + OpenRouter taustakliendid
+│   ├── prompts.py           # Igapäevane prompt + few-shot näited
+│   ├── _json_utils.py       # Tolerantne JSON-parser (avatud mudelite jaoks)
+│   └── client.py            # Anthropic + OpenAI + OpenRouter taustakliendid
 ├── planning/
-│   ├── models.py       # PlanGoal, PlannedSession, WeekPlan, TrainingPlan
-│   ├── prompts.py      # Treeningkava prompt + JSON skeem
-│   └── generator.py    # LLM orkestreerimine, tolerantne parser
+│   ├── models.py            # PlanGoal, PlannedSession, WeekPlan, TrainingPlan
+│   ├── prompts.py           # Treeningkava prompt + JSON skeem
+│   └── generator.py         # LLM orkestreerimine, tolerantne parser
 └── ui/
-    └── charts.py       # Plotly graafikud
-app.py                  # Streamlit entry point
+    └── charts.py            # Plotly graafikud
+app.py                       # Streamlit entry point
+scripts/
+└── enrich_strava_with_polar.py   # CLI: Polari pulsiandmed Strava CSV-sse
 ```
 
 Andmevoog:
@@ -103,7 +108,7 @@ Strava/CSV/Sample ─► TrainingActivity[] ─► Metrics (ACWR, TRIMP) ─► 
 ```bash
 # Testid
 pytest
-pytest --cov=src/jooksuai
+pytest --cov=src/vorm
 
 # Linting (valikuline)
 pip install ruff

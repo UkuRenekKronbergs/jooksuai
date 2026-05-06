@@ -30,7 +30,7 @@ jobs:
           pip install pytest pytest-cov
 
       - name: Run tests
-        run: pytest --cov=src/jooksuai --cov-report=term-missing
+        run: pytest --cov=src/vorm --cov-report=term-missing
 
   lint:
     runs-on: ubuntu-latest

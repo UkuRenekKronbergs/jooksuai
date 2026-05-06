@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from jooksuai.data.sample import generate_sample_activities, load_sample_profile
+from vorm.data.sample import generate_sample_activities, load_sample_profile
 
 
 def test_sample_is_deterministic():

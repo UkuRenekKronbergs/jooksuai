@@ -184,7 +184,7 @@ def enrich_strava_csv(
 
     # Write with UTF-8 BOM so Excel autodetects the encoding — without it,
     # Excel falls back to CP1252 on Windows and turns `ä` into `Ã¤`. Python,
-    # pandas, and the jooksuai CSV loader strip the BOM transparently.
+    # pandas, and the vorm CSV loader strip the BOM transparently.
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", encoding="utf-8-sig", newline="") as f_out:
         writer = csv.writer(f_out)

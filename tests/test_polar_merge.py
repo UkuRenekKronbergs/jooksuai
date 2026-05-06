@@ -6,7 +6,7 @@ import csv
 import json
 from datetime import datetime
 
-from jooksuai.data.polar import (
+from vorm.data.polar import (
     enrich_strava_csv,
     load_polar_sessions,
     parse_polar_session,
