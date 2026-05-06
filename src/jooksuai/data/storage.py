@@ -137,6 +137,7 @@ class ActivityStore:
                 "training_years": profile.training_years,
                 "season_goal": profile.season_goal,
                 "personal_bests": profile.personal_bests,
+                "threshold_pace_min_per_km": profile.threshold_pace_min_per_km,
             }
         )
         with self._conn() as conn:

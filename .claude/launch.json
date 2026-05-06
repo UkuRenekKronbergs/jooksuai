@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "jooksuai (Streamlit)",
-      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeExecutable": "python",
       "runtimeArgs": [
         "-m",
         "streamlit",

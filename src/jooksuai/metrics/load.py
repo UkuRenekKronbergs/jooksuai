@@ -93,6 +93,58 @@ def trimp(
     return 0.0
 
 
+def fitness_form(
+    daily_load: pd.Series,
+    *,
+    ctl_window: int = 42,
+    atl_window: int = 7,
+) -> pd.DataFrame:
+    """Banister fitness/fatigue/form model — TrainingPeaks-style CTL/ATL/TSB.
+
+    - **CTL** (chronic training load, "fitness"): exp.-weighted 42-day mean.
+    - **ATL** (acute training load, "fatigue"): exp.-weighted 7-day mean.
+    - **TSB** (training stress balance, "form"): CTL − ATL.
+
+    Sign of TSB tells you race readiness:
+
+    - **TSB ≥ +25**: deeply detrained / over-rested.
+    - **TSB +5 … +25**: peaked, race-ready window.
+    - **TSB −10 … +5**: optimal training (productive fatigue).
+    - **TSB < −30**: high overreaching risk.
+
+    Uses ``alpha = 1/N`` matching the TrainingPeaks formulation. The series
+    starts at zero, so the first ~3×CTL_window days are warm-up and shouldn't
+    be trusted on their own; with a year of history the warm-up is invisible.
+    """
+    if daily_load.empty:
+        return pd.DataFrame(columns=["ctl", "atl", "tsb"])
+    ctl = daily_load.ewm(alpha=1.0 / ctl_window, adjust=False).mean()
+    atl = daily_load.ewm(alpha=1.0 / atl_window, adjust=False).mean()
+    return pd.DataFrame({"ctl": ctl, "atl": atl, "tsb": ctl - atl})
+
+
+def estimate_rpe_from_hr(
+    avg_hr: int | None,
+    resting_hr: int,
+    max_hr: int,
+) -> int | None:
+    """Synthesize a 1–10 RPE from heart-rate-reserve fraction.
+
+    Karvonen's HRR ≈ Borg-1-10 mapping: ``RPE = round(HRR × 10)``, clipped
+    to [1, 10]. HRR = (avg_hr − resting) / (max − resting). Useful as a
+    fallback when the athlete didn't self-report RPE — most don't, every day.
+
+    Returns ``None`` when ``avg_hr`` is missing, so the caller can distinguish
+    "no data" from "very easy" (RPE 1).
+    """
+    if avg_hr is None or avg_hr <= 0:
+        return None
+    reserve = max(max_hr - resting_hr, 1)
+    hrr = (avg_hr - resting_hr) / reserve
+    hrr = max(0.0, min(hrr, 1.0))
+    return max(1, min(10, round(hrr * 10)))
+
+
 def build_load_timeseries(
     activities: Iterable[TrainingActivity],
     profile: AthleteProfile,
@@ -197,6 +249,8 @@ class LoadSummary:
     total_7d: float
     total_28d: float
     rpe_last_3_days: list[int | None]
+    total_km_7d: float = 0.0
+    total_km_28d: float = 0.0
 
     @property
     def acwr_zone(self) -> str:
@@ -231,6 +285,10 @@ def summarize_load(
     rpe_last_3: list[int | None] = [
         by_date.get(as_of - timedelta(days=i)) for i in range(1, 4)
     ]
+    cutoff_7 = as_of - timedelta(days=6)
+    cutoff_28 = as_of - timedelta(days=27)
+    total_km_7d = sum(a.distance_km for a in items if cutoff_7 <= a.activity_date <= as_of)
+    total_km_28d = sum(a.distance_km for a in items if cutoff_28 <= a.activity_date <= as_of)
 
     return LoadSummary(
         as_of=as_of,
@@ -242,4 +300,6 @@ def summarize_load(
         total_7d=float(daily.tail(7).sum()),
         total_28d=float(daily.tail(28).sum()),
         rpe_last_3_days=rpe_last_3,
+        total_km_7d=float(total_km_7d),
+        total_km_28d=float(total_km_28d),
     )

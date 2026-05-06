@@ -56,3 +56,20 @@ def test_strava_csv_derives_pace_from_average_speed():
     assert activities[0].avg_pace_min_per_km == 4.0
     # Moving Time preferred over Elapsed Time: 2400 / 60 = 40 min
     assert activities[0].duration_min == 40.0
+
+
+# Strava bulk export duplicates "Max Heart Rate". The first column (in the
+# summary block) is usually empty; the populated one is in the per-activity
+# stats block, which pandas renames to "Max Heart Rate.1".
+STRAVA_CSV_DUPLICATE_MAX_HR = """\
+Activity ID,Activity Date,Activity Type,Distance,Elapsed Time,Max Heart Rate,Average Cadence,Max Heart Rate,Average Heart Rate
+55,"Apr 19, 2026, 9:01:49 AM",Run,10000,2400,,77,178,131
+"""
+
+
+def test_strava_csv_picks_max_hr_from_second_duplicate_column():
+    activities = load_activities_csv(StringIO(STRAVA_CSV_DUPLICATE_MAX_HR))
+    assert len(activities) == 1
+    a = activities[0]
+    assert a.avg_hr == 131
+    assert a.max_hr_observed == 178  # from the second "Max Heart Rate" column

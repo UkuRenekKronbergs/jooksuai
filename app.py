@@ -31,10 +31,22 @@ from jooksuai.data import (
 from jooksuai.data.csv_loader import load_activities_csv
 from jooksuai.data.strava import StravaNotConfigured, fetch_recent_activities
 from jooksuai.llm import LLMNotAvailable, build_prompt, generate_recommendation
-from jooksuai.metrics import build_load_timeseries, summarize_load
+from jooksuai.metrics import (
+    PB_DISTANCES,
+    build_load_timeseries,
+    find_personal_bests,
+    summarize_load,
+)
 from jooksuai.planning import PlanGenerationError, PlanGoal, generate_training_plan
 from jooksuai.rules import evaluate_safety_rules
-from jooksuai.ui import acwr_chart, daily_load_chart, rpe_trend_chart, weekly_volume_chart
+from jooksuai.ui import (
+    acwr_chart,
+    daily_load_chart,
+    fitness_form_chart,
+    pb_progression_chart,
+    rpe_trend_chart,
+    weekly_volume_chart,
+)
 
 if __name__ == "__main__" and not st_runtime.exists():
     from streamlit.web import cli as stcli
@@ -52,7 +64,9 @@ def _get_activities(source: str, uploaded_csv, days: int, cfg) -> list[TrainingA
         if uploaded_csv is None:
             return []
         try:
-            return load_activities_csv(io.StringIO(uploaded_csv.getvalue().decode("utf-8")))
+            # utf-8-sig strips a BOM if present — Excel-edited Strava exports
+            # often have one, vanilla Strava exports don't. Either works.
+            return load_activities_csv(io.StringIO(uploaded_csv.getvalue().decode("utf-8-sig")))
         except Exception as exc:
             st.error(f"CSV-i lugemine ebaõnnestus: {exc}")
             return []
@@ -171,6 +185,56 @@ def _render_safety_flags(verdict):
             st.warning(f"**{f.code}** — {f.message}")
 
 
+_WEEKDAY_ET = ["Esmaspäev", "Teisipäev", "Kolmapäev", "Neljapäev", "Reede", "Laupäev", "Pühapäev"]
+_PHASE_ET = {
+    "base": "Baas",
+    "build": "Arendus",
+    "peak": "Tipp",
+    "taper": "Mahalaadimine",
+    "race": "Võistlus",
+}
+
+
+def _format_pace(pace_min_per_km: float | None) -> str:
+    """Decimal min/km → `M:SS/km`. Empty for missing/zero."""
+    if not pace_min_per_km or pace_min_per_km <= 0:
+        return ""
+    minutes = int(pace_min_per_km)
+    seconds = round((pace_min_per_km - minutes) * 60)
+    if seconds == 60:
+        minutes += 1
+        seconds = 0
+    return f"{minutes}:{seconds:02d}/km"
+
+
+def _build_plan_csv(plan) -> bytes:
+    """Build a human-friendly UTF-8-with-BOM CSV from a TrainingPlan.
+
+    BOM lets Excel autodetect UTF-8 (so `ä, ö, ü, õ` don't turn into `Ã¤`).
+    Headers, weekday, and phase are translated to Estonian; pace is formatted
+    as M:SS/km because that's how runners actually read it.
+    """
+    rows = []
+    for w in plan.weeks:
+        phase = _PHASE_ET.get(w.phase.lower(), w.phase)
+        for s in w.sessions:
+            rows.append({
+                "Nädal": w.week_number,
+                "Faas": phase,
+                "Kuupäev": s.session_date.isoformat(),
+                "Nädalapäev": _WEEKDAY_ET[s.session_date.weekday()],
+                "Trenni tüüp": s.session_type,
+                "Intensiivsus": s.intensity_zone,
+                "Kestus (min)": int(round(s.duration_min)) if s.duration_min else 0,
+                "Distants (km)": round(s.distance_km, 1) if s.distance_km else "",
+                "Sihttempo": _format_pace(s.target_pace_min_per_km),
+                "Kirjeldus": (s.description or "").replace("\n", " ").strip(),
+                "Nädala maht (km)": round(w.target_volume_km, 1),
+                "Nädala märkmed": (w.notes or "").replace("\n", " ").strip(),
+            })
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
+
+
 def _summary_table(activities: list[TrainingActivity], today: date) -> pd.DataFrame:
     cutoff = today - timedelta(days=13)
     rows = [
@@ -214,8 +278,27 @@ st.sidebar.divider()
 
 profile = _render_profile_editor(load_sample_profile())
 
+# Load activities before the date picker so we can default the date to the
+# latest activity. Otherwise picking today() on a stale dataset shows
+# ACWR=0/TRIMP=0 because the 7-day window is empty.
+activities = _get_activities(source, uploaded_csv, days, cfg)
+latest_activity_date = max((a.activity_date for a in activities), default=None)
+
+# Reset the widget's session_state when (a) it has never been set, or (b) the
+# stored choice is now past the loaded dataset — the latter handles the case
+# where the user switches from sample data (latest = today) to a stale CSV
+# export (latest = weeks ago) and the cached date is out of range.
+default_date = latest_activity_date or date.today()
+stored = st.session_state.get("analysis_date")
+if stored is None or (latest_activity_date and stored > latest_activity_date):
+    st.session_state["analysis_date"] = default_date
+
 st.sidebar.divider()
-analysis_date: date = st.sidebar.date_input("Analüüsi kuupäev", value=date.today())
+analysis_date: date = st.sidebar.date_input(
+    "Analüüsi kuupäev",
+    key="analysis_date",
+    help="Vaikimisi viimase laaditud trenni kuupäev. Muuda, et analüüsida mõnd varasemat hetke.",
+)
 
 st.sidebar.divider()
 if cfg.has_llm:
@@ -231,14 +314,20 @@ st.caption(
     "Vigastuse või haiguse kahtluse korral pöördu spetsialisti poole."
 )
 
-activities = _get_activities(source, uploaded_csv, days, cfg)
-
 if not activities:
     st.info("Andmed pole veel laaditud. Vali vasakul andmeallikas või lae CSV.")
     st.stop()
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Tänane soovitus", "Koormuse ajalugu", "Retrospektiivne test", "Treeningkava"]
+if analysis_date > latest_activity_date:
+    gap_days = (analysis_date - latest_activity_date).days
+    st.warning(
+        f"Valitud kuupäev on {gap_days} päeva pärast viimast trenni "
+        f"({latest_activity_date.isoformat()}). 7-päeva aknas ei pruugi olla andmeid — "
+        "ACWR ja akuutne TRIMP võivad näidata 0. Liiguta kuupäev tagasi viimasele trenni-päevale."
+    )
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Tänane soovitus", "Koormuse ajalugu", "Tippajad", "Retrospektiivne test", "Treeningkava"]
 )
 
 # --- Tab 1: today's recommendation
@@ -350,13 +439,58 @@ with tab2:
     with col3:
         st.plotly_chart(weekly_volume_chart(activities), width="stretch")
     with col4:
-        st.plotly_chart(rpe_trend_chart(activities), width="stretch")
+        st.plotly_chart(rpe_trend_chart(activities, profile), width="stretch")
+
+    st.markdown("#### Fitness / Fatigue / Form (Banister)")
+    st.caption(
+        "**CTL** (sinine) on krooniline koormus — vorm. **ATL** (punane) on akuutne koormus — väsimus. "
+        "**TSB** (roheline, paremal teljel) = CTL − ATL = vorm. Negatiivne TSB = väsinud, "
+        "TSB +5…+25 = võistluseks valmis (rohelisel ribal)."
+    )
+    st.plotly_chart(fitness_form_chart(daily), width="stretch")
 
     st.markdown("#### Viimase 14 päeva kokkuvõte")
     st.dataframe(_summary_table(activities, analysis_date), width="stretch", hide_index=True)
 
-# --- Tab 3: retrospective test
+# --- Tab 3: personal bests
 with tab3:
+    st.markdown(
+        "Tippajad on tuvastatud iga jooksu põhjal, mille distants on standardse võistlus-distantsi "
+        "lähedal (±5%). See püüab nii võistlused kui tempo-trennid, mille pikkus juhtus täpselt "
+        "5/10 km olema — kummalgi juhul on jooksja praeguse vormi-lae markerina kasutatav."
+    )
+
+    pbs = find_personal_bests(activities)
+    if not pbs:
+        st.info("Ühtegi standard-distantsi PB-d ei tuvastatud. Lae rohkem andmeid.")
+    else:
+        rows = [
+            {
+                "Distants": p.distance_label,
+                "Aeg": p.time_formatted,
+                "Tempo": f"{p.pace_min_per_km:.2f} min/km",
+                "Tegelik km": f"{p.activity_distance_km:.2f}",
+                "Kuupäev": p.activity_date.isoformat(),
+                "Kommentaar": (p.activity_notes or "")[:60],
+            }
+            for p in pbs
+        ]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+        st.markdown("#### Progressioon ajas")
+        labels_with_data = [(label, km) for label, km in PB_DISTANCES if any(p.distance_label == label for p in pbs)]
+        if labels_with_data:
+            chosen = st.selectbox(
+                "Vali distants",
+                options=[label for label, _ in labels_with_data],
+                index=0,
+                key="pb_distance",
+            )
+            chosen_km = next(km for label, km in labels_with_data if label == chosen)
+            st.plotly_chart(pb_progression_chart(activities, chosen, chosen_km), width="stretch")
+
+# --- Tab 4: retrospective test
+with tab4:
     st.markdown(
         "Retrospektiivne test: vali varasem kuupäev, mille puhul näed mudeli soovitust, "
         "arvestades ainult *selleks päevaks* teadaolevaid andmeid. Järgi plaani "
@@ -417,8 +551,8 @@ with tab3:
             _render_safety_flags(retro_verdict)
             _render_verdict_box(retro_verdict, retro_llm)
 
-# --- Tab 4: training plan generator
-with tab4:
+# --- Tab 5: training plan generator
+with tab5:
     st.markdown(
         "Genereeri **täielik päev-haaval treeningkava** võistluseks. Mudel arvestab sinu profiili, "
         "tippaegu, praegust vormi (ACWR/monotoonsus) ja valitud sihtaega. Kulu ~€0.001–0.01 per plaan "
@@ -501,15 +635,17 @@ with tab4:
                 ):
                     if week.notes:
                         st.caption(week.notes)
+                    # Stringify numeric columns where missing values use em-dash —
+                    # mixed float/str columns make pyarrow log a noisy warning.
                     rows = [
                         {
                             "Kuupäev": s.session_date.isoformat(),
                             "Nädalapäev": ["E", "T", "K", "N", "R", "L", "P"][s.session_date.weekday()],
                             "Tüüp": s.session_type,
                             "Tsoon": s.intensity_zone,
-                            "Kestus (min)": round(s.duration_min, 0),
-                            "km": round(s.distance_km, 1) if s.distance_km else "—",
-                            "Sihttempo": f"{s.target_pace_min_per_km:.2f}" if s.target_pace_min_per_km else "—",
+                            "Kestus (min)": int(round(s.duration_min)),
+                            "km": f"{s.distance_km:.1f}" if s.distance_km else "—",
+                            "Sihttempo": _format_pace(s.target_pace_min_per_km) or "—",
                             "Kirjeldus": s.description,
                         }
                         for s in week.sessions
@@ -517,23 +653,7 @@ with tab4:
                     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
             st.markdown("### Eksport")
-            flat_rows = [
-                {
-                    "week_number": w.week_number,
-                    "week_start": w.week_start.isoformat(),
-                    "phase": w.phase,
-                    "session_date": s.session_date.isoformat(),
-                    "session_type": s.session_type,
-                    "duration_min": s.duration_min,
-                    "intensity_zone": s.intensity_zone,
-                    "target_pace_min_per_km": s.target_pace_min_per_km,
-                    "distance_km": s.distance_km,
-                    "description": s.description,
-                }
-                for w in plan.weeks
-                for s in w.sessions
-            ]
-            csv_bytes = pd.DataFrame(flat_rows).to_csv(index=False).encode("utf-8")
+            csv_bytes = _build_plan_csv(plan)
             st.download_button(
                 "Lae alla CSV-failina",
                 data=csv_bytes,

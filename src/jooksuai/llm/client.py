@@ -10,11 +10,10 @@ risk 3 in the plan.
 
 from __future__ import annotations
 
-import json
-import re
 from dataclasses import dataclass
 
 from ..config import OPENROUTER_BASE_URL, Config
+from ._json_utils import extract_json_object
 from .prompts import PromptBundle
 
 
@@ -242,19 +241,10 @@ def _parse_json_with_retry(text: str, _client, prompt: PromptBundle, config: Con
 
 
 def _extract_json(text: str) -> dict:
-    # Strip markdown fences if the model wrapped output in ```json ... ```
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        # Last-ditch: grab the first {...} block.
-        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                pass
-        raise LLMParseError(f"invalid JSON: {exc.msg}") from exc
+        return extract_json_object(text)
+    except ValueError as exc:
+        raise LLMParseError(str(exc)) from exc
 
 
 def _build_recommendation(

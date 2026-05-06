@@ -84,7 +84,7 @@ def _parse_strava(df: pd.DataFrame) -> list[TrainingActivity]:
                 distance_km=distance_km,
                 duration_min=duration_min,
                 avg_hr=_opt_int(row.get("avg_hr")),
-                max_hr_observed=_opt_int(row.get("max_hr_observed")),
+                max_hr_observed=_resolve_max_hr_observed(row),
                 avg_pace_min_per_km=avg_pace,
                 elevation_gain_m=_opt_float(row.get("elevation_gain_m")),
                 notes=_opt_str(row.get("notes")),
@@ -126,6 +126,19 @@ def _resolve_duration_min(row: dict) -> float:
         if f > 0:
             return f / 60.0
     return 0.0
+
+
+def _resolve_max_hr_observed(row: dict) -> int | None:
+    """Strava bulk-export has two ``Max Heart Rate`` columns. The first is in the
+    activity-summary block (often empty); the second is in the per-activity stats
+    block (the real one, paired with ``Average Heart Rate``). Pandas renames the
+    duplicate to ``Max Heart Rate.1`` — try the populated one first.
+    """
+    for key in ("Max Heart Rate.1", "max_hr_observed"):
+        val = _opt_int(row.get(key))
+        if val:
+            return val
+    return None
 
 
 def _resolve_pace_min_per_km(row: dict, distance_km: float, duration_min: float) -> float | None:

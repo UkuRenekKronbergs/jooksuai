@@ -11,12 +11,11 @@ can show a clean error rather than a traceback.
 
 from __future__ import annotations
 
-import json
-import re
 from datetime import date, datetime
 
 from ..config import OPENROUTER_BASE_URL, Config
 from ..data.models import AthleteProfile
+from ..llm._json_utils import extract_json_object
 from ..llm.client import LLMNotAvailable
 from ..metrics.load import LoadSummary
 from .models import PlanGoal, PlannedSession, TrainingPlan, WeekPlan
@@ -85,11 +84,20 @@ def _call_anthropic(system: str, user: str, config: Config) -> str:
     except ImportError as exc:
         raise LLMNotAvailable("anthropic SDK not installed") from exc
     client = anthropic.Anthropic(api_key=config.anthropic_api_key)
+    # Cache the system prompt — same wording across attempts and any retry, so
+    # the second call lands within the 5-min TTL and avoids re-billing the
+    # ~1k-token coaching preamble.
     resp = client.messages.create(
         model=config.llm_model,
         max_tokens=8192,  # plan is large
         temperature=config.llm_temperature,
-        system=system,
+        system=[
+            {
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
         messages=[{"role": "user", "content": user}],
     )
     return resp.content[0].text if resp.content else ""
@@ -101,39 +109,39 @@ def _call_openai_compatible(system: str, user: str, config: Config) -> str:
     except ImportError as exc:
         raise LLMNotAvailable("openai SDK not installed") from exc
 
-    kwargs: dict = {}
+    client_kwargs: dict = {}
     if config.llm_provider == "openrouter":
-        kwargs["api_key"] = config.openrouter_api_key
-        kwargs["base_url"] = OPENROUTER_BASE_URL
-        kwargs["default_headers"] = {
+        client_kwargs["api_key"] = config.openrouter_api_key
+        client_kwargs["base_url"] = OPENROUTER_BASE_URL
+        client_kwargs["default_headers"] = {
             "HTTP-Referer": "https://github.com/UkuRenekKronbergs/jooksuai",
             "X-Title": "jooksuai",
         }
     else:
-        kwargs["api_key"] = config.openai_api_key
+        client_kwargs["api_key"] = config.openai_api_key
 
-    client = OpenAI(**kwargs)
-    resp = client.chat.completions.create(
-        model=config.llm_model,
-        temperature=config.llm_temperature,
-        max_tokens=8192,
-        messages=[
+    client = OpenAI(**client_kwargs)
+    create_kwargs: dict = {
+        "model": config.llm_model,
+        "temperature": config.llm_temperature,
+        "max_tokens": 8192,
+        "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-    )
+    }
+    # Native OpenAI supports strict JSON mode and benefits from it on a 7000-
+    # token plan response. Skip on OpenRouter — many proxied open models 400
+    # when given response_format.
+    if config.llm_provider == "openai":
+        create_kwargs["response_format"] = {"type": "json_object"}
+
+    resp = client.chat.completions.create(**create_kwargs)
     return resp.choices[0].message.content or ""
 
 
 def _extract_json(text: str) -> dict:
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        raise ValueError("no JSON object found in output") from None
+    return extract_json_object(text)
 
 
 def _plan_from_json(

@@ -19,6 +19,8 @@ from jooksuai.metrics.load import (
     build_load_timeseries,
     compute_monotony,
     compute_strain,
+    estimate_rpe_from_hr,
+    fitness_form,
     summarize_load,
     trimp,
 )
@@ -148,7 +150,7 @@ def test_acwr_spike_pushes_ratio_high(profile, easy_run_factory, today):
         )
         for i in range(7)
     ]
-    series = build_load_timeseries(base + spike, profile)
+    series = build_load_timeseries(base + spike, profile, end=today)
     ratios = acwr_series(series)
     assert ratios["acwr"].iloc[-1] > ACWR_DANGER_HIGH
 
@@ -180,7 +182,7 @@ def test_monotony_varied_loads_computes_positive(profile, today):
         )
         for i in range(7)
     ]
-    series = build_load_timeseries(activities, profile)
+    series = build_load_timeseries(activities, profile, end=today)
     m = compute_monotony(series)
     assert m is not None and m > 0
 
@@ -197,7 +199,7 @@ def test_strain_is_weekly_load_times_monotony(profile, today):
         )
         for i in range(7)
     ]
-    series = build_load_timeseries(activities, profile)
+    series = build_load_timeseries(activities, profile, end=today)
     strain = compute_strain(series)
     monotony = compute_monotony(series)
     assert strain is not None and monotony is not None
@@ -206,15 +208,101 @@ def test_strain_is_weekly_load_times_monotony(profile, today):
 
 # --- Summary --------------------------------------------------------------
 
-def test_summarize_load_sweet_spot(profile, easy_run_factory):
+def test_summarize_load_sweet_spot(profile, easy_run_factory, today):
     activities = easy_run_factory(days=40)
-    summary = summarize_load(activities, profile)
+    summary = summarize_load(activities, profile, as_of=today)
     assert summary.acwr is not None
     assert ACWR_SWEET_SPOT[0] <= summary.acwr <= ACWR_SWEET_SPOT[1]
     assert summary.acwr_zone == "optimaalne"
 
 
-def test_summarize_load_empty(profile):
-    summary = summarize_load([], profile)
+# --- Banister fitness/fatigue/form ---------------------------------------
+
+def test_fitness_form_constant_load_converges_to_load_with_zero_tsb(profile, easy_run_factory, today):
+    # 200 days of identical load — CTL and ATL both converge to the daily load,
+    # so TSB should approach 0 by the end.
+    activities = easy_run_factory(days=200, avg_hr=140, duration_min=45)
+    series = build_load_timeseries(activities, profile, end=today)
+    df = fitness_form(series)
+    assert not df.empty
+    assert math.isclose(df["ctl"].iloc[-1], df["atl"].iloc[-1], rel_tol=0.01)
+    assert abs(df["tsb"].iloc[-1]) < 0.5
+
+
+def test_fitness_form_recent_spike_makes_tsb_negative(profile, easy_run_factory, today):
+    # 60 days of base, then a 7-day spike → ATL > CTL → TSB negative.
+    base = easy_run_factory(days=60, avg_hr=130, duration_min=30)
+    spike = [
+        TrainingActivity(
+            id=f"sp-{i}", activity_date=today - timedelta(days=i),
+            activity_type="Run", distance_km=18, duration_min=100, avg_hr=170,
+        )
+        for i in range(7)
+    ]
+    series = build_load_timeseries(base + spike, profile, end=today)
+    df = fitness_form(series)
+    assert df["tsb"].iloc[-1] < -10
+
+
+def test_fitness_form_taper_makes_tsb_positive(profile, easy_run_factory, today):
+    # 90 days of solid base, then 14 days of nothing (taper/rest).
+    base_end = today - timedelta(days=14)
+    base = easy_run_factory(days=90, avg_hr=150, duration_min=60, start=base_end - timedelta(days=89))
+    series = build_load_timeseries(base, profile, end=today)
+    df = fitness_form(series)
+    # CTL still elevated from base, ATL has decayed → positive form.
+    assert df["tsb"].iloc[-1] > 5
+
+
+def test_fitness_form_empty_returns_empty():
+    import pandas as pd
+    df = fitness_form(pd.Series(dtype=float))
+    assert df.empty
+    assert list(df.columns) == ["ctl", "atl", "tsb"]
+
+
+# --- Estimated RPE -------------------------------------------------------
+
+def test_estimate_rpe_easy_aerobic_returns_low_value():
+    # HRR ≈ (130-50)/(190-50) = 0.571 → RPE 6
+    assert estimate_rpe_from_hr(130, 50, 190) == 6
+
+
+def test_estimate_rpe_threshold_returns_seven_or_eight():
+    # HRR ≈ (165-50)/(190-50) = 0.821 → RPE 8
+    assert estimate_rpe_from_hr(165, 50, 190) == 8
+
+
+def test_estimate_rpe_recovery_returns_low():
+    # HRR ≈ (95-50)/(190-50) = 0.321 → RPE 3
+    assert estimate_rpe_from_hr(95, 50, 190) == 3
+
+
+def test_estimate_rpe_clamps_above_max_to_ten():
+    assert estimate_rpe_from_hr(220, 50, 190) == 10
+
+
+def test_estimate_rpe_clamps_at_resting_to_one():
+    # At resting HR the formula gives 0 — we clip to 1 (lowest defined RPE).
+    assert estimate_rpe_from_hr(50, 50, 190) == 1
+
+
+def test_estimate_rpe_returns_none_when_hr_missing():
+    assert estimate_rpe_from_hr(None, 50, 190) is None
+    assert estimate_rpe_from_hr(0, 50, 190) is None
+
+
+def test_summarize_load_empty(profile, today):
+    summary = summarize_load([], profile, as_of=today)
     assert summary.acwr is None
     assert summary.acute_7d == 0.0
+    assert summary.total_km_7d == 0.0
+    assert summary.total_km_28d == 0.0
+
+
+def test_summarize_load_includes_weekly_km(profile, easy_run_factory, today):
+    # 14 identical 9 km runs over 14 days → last 7 days should sum to 63 km.
+    activities = easy_run_factory(days=14, distance_km=9.0)
+    summary = summarize_load(activities, profile, as_of=today)
+    assert math.isclose(summary.total_km_7d, 63.0, abs_tol=0.01)
+    assert math.isclose(summary.total_km_28d, 14 * 9.0, abs_tol=0.01)
