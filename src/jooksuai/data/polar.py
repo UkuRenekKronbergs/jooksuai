@@ -21,9 +21,8 @@ from __future__ import annotations
 
 import csv
 import json
-from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -54,7 +53,7 @@ def parse_polar_session(payload: dict, source_file: str = "") -> PolarSession | 
     except ValueError:
         return None
     if start_local.tzinfo is not None:
-        start_utc = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+        start_utc = start_local.astimezone(UTC).replace(tzinfo=None)
     else:
         offset_min = int(payload.get("timezoneOffsetMinutes") or 0)
         start_utc = start_local - timedelta(minutes=offset_min)
