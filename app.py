@@ -18,7 +18,6 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-import streamlit.runtime as st_runtime
 
 from vorm.config import load_config
 from vorm.data import (
@@ -48,7 +47,7 @@ from vorm.ui import (
     weekly_volume_chart,
 )
 
-if __name__ == "__main__" and not st_runtime.exists():
+if __name__ == "__main__" and not st.runtime.exists():
     from streamlit.web import cli as stcli
 
     sys.argv = ["streamlit", "run", str(Path(__file__).resolve())]
