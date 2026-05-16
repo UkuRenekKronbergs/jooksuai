@@ -19,6 +19,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from vorm import auth
 from vorm.config import CACHE_DIR, load_config
 from vorm.data import (
     AthleteProfile,
@@ -217,9 +218,78 @@ def _render_safety_flags(verdict):
 
 
 @st.cache_resource
-def _get_store() -> ActivityStore:
-    """SQLite store shared across reruns; cached so we don't reopen per click."""
+def _get_local_store() -> ActivityStore:
+    """Local SQLite store shared across reruns; cached so we don't reopen per click.
+
+    Used in anonymous mode (no Supabase configured) and as a fallback if the
+    Supabase client transiently fails. Per-user isolation is NOT enforced here
+    — local SQLite is always single-tenant.
+    """
     return ActivityStore(CACHE_DIR / "activities.sqlite")
+
+
+def _get_user_store():
+    """Resolve the user-scoped store for profile + daily logs.
+
+    Returns SupabaseStore when the user is signed in (per-user, RLS-protected),
+    else the local SQLite ActivityStore (anonymous demo mode). Both expose
+    ``save_profile``/``load_profile`` and ``save_daily_log``/``get_daily_log``/
+    ``list_daily_logs`` so call sites don't branch on backend.
+    """
+    cfg_now = load_config()
+    if cfg_now.has_supabase:
+        store = auth.get_store()
+        if store is not None:
+            return store
+    return _get_local_store()
+
+
+_PROFILE_CACHE_KEY = "_vorm_profile_loaded"
+_PROFILE_MISSING = "__MISSING__"
+
+
+def _load_initial_profile() -> AthleteProfile:
+    """Load the saved profile once per Streamlit session.
+
+    Delegates to ``_get_user_store()`` so the same code path covers both
+    Supabase (signed-in user) and local SQLite (anonymous mode). Caches in
+    session_state to skip the round-trip on every rerun. Falls back to the
+    bundled sample profile when no saved row exists yet or the store errors.
+    """
+    cached = st.session_state.get(_PROFILE_CACHE_KEY)
+    if isinstance(cached, AthleteProfile):
+        return cached
+    if cached == _PROFILE_MISSING:
+        return load_sample_profile()
+    try:
+        loaded = _get_user_store().load_profile()
+    except Exception:
+        loaded = None
+    if loaded:
+        st.session_state[_PROFILE_CACHE_KEY] = loaded
+        return loaded
+    st.session_state[_PROFILE_CACHE_KEY] = _PROFILE_MISSING
+    return load_sample_profile()
+
+
+def _autosave_profile(profile: AthleteProfile) -> None:
+    """Persist the profile when it differs from the cached (last-saved) one.
+
+    Streamlit reruns the whole script on every interaction, so the no-op
+    equality check is what keeps this from hammering the store. Saves go to
+    Supabase when signed in, local SQLite otherwise — same call site either
+    way. Failures surface as a quiet sidebar warning so a transient network
+    blip doesn't crash the page.
+    """
+    cached = st.session_state.get(_PROFILE_CACHE_KEY)
+    if isinstance(cached, AthleteProfile) and cached == profile:
+        return
+    try:
+        _get_user_store().save_profile(profile)
+    except Exception as exc:
+        st.sidebar.warning(f"Profiili ei õnnestunud salvestada: {exc}", icon="⚠️")
+        return
+    st.session_state[_PROFILE_CACHE_KEY] = profile
 
 
 def _render_daily_log_form(
@@ -228,7 +298,7 @@ def _render_daily_log_form(
     rationale: str | None,
 ) -> None:
     """Project Plan §4.3 — collect the athlete's daily reaction to the rec."""
-    store = _get_store()
+    store = _get_user_store()
     existing = store.get_daily_log(log_day)
     with st.form(f"daily_log_{log_day.isoformat()}", clear_on_submit=False):
         st.markdown(f"#### Päeva-logi — {log_day.isoformat()}")
@@ -353,8 +423,21 @@ def _summary_table(activities: list[TrainingActivity], today: date) -> pd.DataFr
 # --- Sidebar --------------------------------------------------------------
 cfg = load_config()
 
+# Auth gate: when Supabase is configured, require login before any UI renders.
+# Without Supabase the app runs in anonymous mode against local SQLite — useful
+# for local dev and offline demos.
+auth_user = None
+if cfg.has_supabase:
+    auth_user = auth.render_login_gate()
+    if auth_user is None:
+        st.stop()
+
 st.sidebar.title("🏃 Vorm.ai")
 st.sidebar.caption("AI-põhine treeningkoormuse analüüsija")
+
+if auth_user:
+    auth.render_sidebar_user_panel()
+    st.sidebar.divider()
 
 data_source_options = ["Näidisandmed", "CSV-fail", "Garmin GPX-kaust"]
 if cfg.has_strava:
@@ -390,7 +473,8 @@ if source == "Garmin GPX-kaust":
 
 st.sidebar.divider()
 
-profile = _render_profile_editor(load_sample_profile())
+profile = _render_profile_editor(_load_initial_profile())
+_autosave_profile(profile)
 
 # Load activities before the date picker so we can default the date to the
 # latest activity. Otherwise picking today() on a stale dataset shows
@@ -563,16 +647,39 @@ with tab1:
         elif not today_plan.strip():
             st.warning("Sisesta täna planeeritud treening, et saada LLM-soovitust.")
 
-        _render_verdict_box(verdict, llm_result)
+        # Stash the evaluation so it survives the rerun that fires when the
+        # daily-log form is submitted. Without this, the form is conditionally
+        # rendered inside an `if st.button()` and Streamlit's "button True only
+        # on the rerun after click" semantics means a submit causes the entire
+        # block (including the form's submit handler) to vanish before it
+        # runs — daily logs silently never persist.
+        st.session_state["last_evaluation"] = {
+            "analysis_date": analysis_date,
+            "verdict": verdict,
+            "llm_result": llm_result,
+            "prompt_text": prompt_bundle.user,
+        }
+
+    eval_state = st.session_state.get("last_evaluation")
+    if eval_state and eval_state.get("analysis_date") == analysis_date:
+        _render_verdict_box(eval_state["verdict"], eval_state["llm_result"])
 
         with st.expander("Näita LLM-i kasutatud prompti (diagnostika)"):
-            st.code(prompt_bundle.user, language="markdown")
+            st.code(eval_state["prompt_text"], language="markdown")
 
         st.divider()
         _render_daily_log_form(
             log_day=analysis_date,
-            recommended_category=(llm_result.category if llm_result else verdict.recommendation.value),
-            rationale=(llm_result.rationale if llm_result else None),
+            recommended_category=(
+                eval_state["llm_result"].category
+                if eval_state["llm_result"]
+                else eval_state["verdict"].recommendation.value
+            ),
+            rationale=(
+                eval_state["llm_result"].rationale
+                if eval_state["llm_result"]
+                else None
+            ),
         )
 
 # --- Tab 2: history
@@ -818,7 +925,7 @@ with tab6:
         "lähevad valideerimise §4.3 (isiklik igapäevane kasutus) analüüsi."
     )
 
-    log_store = _get_store()
+    log_store = _get_user_store()
     logs = log_store.list_daily_logs()
     if not logs:
         st.info(

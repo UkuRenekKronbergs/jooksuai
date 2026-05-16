@@ -88,6 +88,8 @@ class Config:
     strava_client_id: str | None
     strava_client_secret: str | None
     strava_refresh_token: str | None
+    supabase_url: str | None
+    supabase_anon_key: str | None
     llm_provider: str
     llm_model: str
     llm_temperature: float
@@ -115,6 +117,13 @@ class Config:
             and self.strava_client_secret
             and self.strava_refresh_token
         )
+
+    @property
+    def has_supabase(self) -> bool:
+        """True when Supabase auth + DB is wired up. Drives the multi-user
+        login-required code path; when False, app falls back to local SQLite +
+        anonymous single-user mode."""
+        return bool(self.supabase_url and self.supabase_anon_key)
 
     @property
     def has_llm(self) -> bool:
@@ -155,6 +164,8 @@ def load_config() -> Config:
         strava_client_id=_get("STRAVA_CLIENT_ID") or None,
         strava_client_secret=_get("STRAVA_CLIENT_SECRET") or None,
         strava_refresh_token=_get("STRAVA_REFRESH_TOKEN") or None,
+        supabase_url=_get("SUPABASE_URL") or None,
+        supabase_anon_key=_get("SUPABASE_ANON_KEY") or None,
         llm_provider=provider,
         llm_model=_get("LLM_MODEL", default_model),
         llm_temperature=float(_get("LLM_TEMPERATURE", "0") or "0"),
