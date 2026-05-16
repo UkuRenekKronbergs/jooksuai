@@ -20,6 +20,24 @@ def test_browser_session_key_uses_vorm_cookie(monkeypatch):
     assert auth.st.session_state[auth._COOKIE_SESSION_KEY] == cookie_value
 
 
+def test_read_browser_session_cookie_uses_controller_fallback(monkeypatch):
+    cookie_value = "controller-session-abcdefghijklmnopqrstuvwxyz"
+
+    class FakeCookies:
+        def to_dict(self):
+            return {}
+
+    class FakeController:
+        def get(self, name):
+            assert name == auth._COOKIE_NAME
+            return cookie_value
+
+    monkeypatch.setattr(auth.st, "context", SimpleNamespace(cookies=FakeCookies()))
+    monkeypatch.setattr(auth, "_cookie_controller", lambda: FakeController())
+
+    assert auth._read_browser_session_cookie() == cookie_value
+
+
 def test_sync_browser_session_cookie_creates_opaque_cookie(monkeypatch):
     rendered = []
     generated = "generated-session-abcdefghijklmnopqrstuvwxyz"
@@ -27,15 +45,15 @@ def test_sync_browser_session_cookie_creates_opaque_cookie(monkeypatch):
     monkeypatch.setattr(auth.secrets, "token_urlsafe", lambda length: generated)
     monkeypatch.setattr(
         auth,
-        "_render_cookie_script",
-        lambda session_id=None, *, delete=False: rendered.append((session_id, delete)),
+        "_set_browser_session_cookie",
+        lambda session_id: rendered.append(session_id),
     )
     monkeypatch.setattr(auth.st, "session_state", {})
 
     auth._sync_browser_session_cookie()
 
     assert auth.st.session_state[auth._COOKIE_SESSION_KEY] == generated
-    assert rendered == [(generated, False)]
+    assert rendered == [generated]
 
 
 def test_forget_persistent_session_schedules_cookie_delete(monkeypatch):

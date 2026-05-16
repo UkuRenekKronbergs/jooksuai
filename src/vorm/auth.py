@@ -53,6 +53,7 @@ _PASSWORD_RESET_DONE_KEY = "_vorm_password_reset_done"
 _GUEST_KEY = "_vorm_guest_mode"
 _COOKIE_SESSION_KEY = "_vorm_browser_session_id"
 _COOKIE_DELETE_PENDING_KEY = "_vorm_browser_session_delete_pending"
+_COOKIE_CONTROLLER_STATE_KEY = "_vorm_cookie_controller_state"
 _COOKIE_NAME = "vorm_session"
 _PASSWORD_RESET_FLOW = "password_reset"
 _AUTH_QUERY_KEYS = (
@@ -92,12 +93,59 @@ def _is_valid_session_id(value: str | None) -> bool:
     return all(ch.isalnum() or ch in "-_" for ch in value)
 
 
+def _cookie_controller():
+    try:
+        from streamlit_cookies_controller import CookieController  # noqa: PLC0415
+    except Exception:
+        return None
+    try:
+        return CookieController(key=_COOKIE_CONTROLLER_STATE_KEY)
+    except Exception:
+        return None
+
+
 def _read_browser_session_cookie() -> str | None:
     try:
         value = st.context.cookies.to_dict().get(_COOKIE_NAME)
     except Exception:
+        value = None
+    if _is_valid_session_id(value):
+        return value
+
+    controller = _cookie_controller()
+    if controller is None:
+        return None
+    try:
+        value = controller.get(_COOKIE_NAME)
+    except Exception:
         return None
     return value if _is_valid_session_id(value) else None
+
+
+def _set_browser_session_cookie(session_id: str) -> None:
+    controller = _cookie_controller()
+    if controller is not None:
+        try:
+            controller.set(
+                _COOKIE_NAME,
+                session_id,
+                path="/",
+                max_age=_COOKIE_MAX_AGE_SECONDS,
+                same_site="lax",
+            )
+        except Exception:
+            pass
+    _render_cookie_script(session_id)
+
+
+def _delete_browser_session_cookie() -> None:
+    controller = _cookie_controller()
+    if controller is not None:
+        try:
+            controller.remove(_COOKIE_NAME, path="/", same_site="lax")
+        except Exception:
+            pass
+    _render_cookie_script(delete=True)
 
 
 def _render_cookie_script(session_id: str | None = None, *, delete: bool = False) -> None:
@@ -138,7 +186,7 @@ def _render_cookie_script(session_id: str | None = None, *, delete: bool = False
 
 def _sync_browser_session_cookie() -> None:
     if st.session_state.pop(_COOKIE_DELETE_PENDING_KEY, False):
-        _render_cookie_script(delete=True)
+        _delete_browser_session_cookie()
         st.session_state.pop(_COOKIE_SESSION_KEY, None)
         return
 
@@ -149,12 +197,12 @@ def _sync_browser_session_cookie() -> None:
 
     state_value = st.session_state.get(_COOKIE_SESSION_KEY)
     if _is_valid_session_id(state_value):
-        _render_cookie_script(state_value)
+        _set_browser_session_cookie(state_value)
         return
 
     session_id = secrets.token_urlsafe(32)
     st.session_state[_COOKIE_SESSION_KEY] = session_id
-    _render_cookie_script(session_id)
+    _set_browser_session_cookie(session_id)
 
 
 def _browser_session_key() -> str | None:
@@ -205,7 +253,7 @@ def _remember_persistent_session(kind: str, user: AuthUser | None = None) -> Non
         return
     st.session_state.pop(_COOKIE_DELETE_PENDING_KEY, None)
     if _is_valid_session_id(key):
-        _render_cookie_script(key)
+        _set_browser_session_cookie(key)
     registry = _persistent_sessions()
     with registry["lock"]:
         sessions = registry["sessions"]
