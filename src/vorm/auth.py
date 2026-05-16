@@ -235,7 +235,7 @@ def render_login_gate() -> AuthUser | None:
                 "Parool", type="password", key="_vorm_login_password",
             )
             submitted = st.form_submit_button(
-                "Logi sisse", type="primary", use_container_width=True
+                "Logi sisse", type="primary", width="stretch"
             )
             if submitted:
                 cleaned_email = (email or "").strip().lower()
@@ -270,7 +270,7 @@ def render_login_gate() -> AuthUser | None:
                 key="_vorm_signup_password_confirm",
             )
             submitted = st.form_submit_button(
-                "Loo konto", type="primary", use_container_width=True
+                "Loo konto", type="primary", width="stretch"
             )
             if submitted:
                 cleaned_email = (new_email or "").strip().lower()
@@ -308,7 +308,7 @@ def render_login_gate() -> AuthUser | None:
     if st.button(
         "👤 Jätka külalisena",
         key="_vorm_enter_guest",
-        use_container_width=True,
+        width="stretch",
     ):
         enter_guest_mode()
         st.rerun()
@@ -322,7 +322,7 @@ def render_sidebar_user_panel() -> None:
     if user:
         with st.sidebar:
             st.markdown(f"👤 **{user.email}**")
-            if st.button("Logi välja", key="_vorm_sign_out", use_container_width=True):
+            if st.button("Logi välja", key="_vorm_sign_out", width="stretch"):
                 sign_out()
                 st.rerun()
         return
@@ -333,7 +333,7 @@ def render_sidebar_user_panel() -> None:
             if st.button(
                 "Logi sisse / loo konto",
                 key="_vorm_exit_guest",
-                use_container_width=True,
+                width="stretch",
             ):
                 exit_guest_mode()
                 st.rerun()

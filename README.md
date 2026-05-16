@@ -51,7 +51,7 @@ python scripts/strava_bootstrap.py
 streamlit run app.py
 ```
 
-Esimesel käivitamisel kasuta **Näidisandmed**-valikut — 90 päeva deterministlikult genereeritud näidisjooksu valmistavad terve UI demoks ette. Ilma LLM-võtmeta jookseb kõik peale soovituse teksti — ACWR, graafikud ja reeglitepõhine vastus töötavad ka offline.
+Esimesel käivitamisel on andmeallikas **Käsitsi lisamine** ja vaade algab tühjalt. Demo proovimiseks vajuta sidebar'is **Täida demoandmetega** — 90 päeva deterministlikult genereeritud näidisjooksu valmistavad terve UI demoks ette. Ilma LLM-võtmeta jookseb kõik peale soovituse teksti — ACWR, graafikud ja reeglitepõhine vastus töötavad ka offline.
 
 ### Strava-andmete vahemälu
 
@@ -216,7 +216,7 @@ Rakendus on cloud-deploy-valmis. Failisüsteemil ei pea olema kirjeldatud sõltu
    ```
 5. Saad URL-i kujul `https://vorm-ai.streamlit.app`.
 
-Cloud-režiimis vaikimisi andmeallikas on **Näidisandmed** — täielik demo töötab ilma isikuandmeteta.
+Cloud-režiimis vaikimisi andmeallikas on **Käsitsi lisamine** ja see on tühi. Täielik demo töötab ilma isikuandmeteta sidebar'i **Täida demoandmetega** nupu kaudu.
 
 ### Cloud-spetsiifika
 

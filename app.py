@@ -61,11 +61,26 @@ if __name__ == "__main__" and not st.runtime.exists():
 
 st.set_page_config(page_title="Vorm.ai — treeningkoormuse analüüsija", page_icon="🏃", layout="wide")
 
+_SOURCE_MANUAL = "Käsitsi lisamine"
+_SOURCE_CSV = "CSV-fail"
+_SOURCE_STRAVA = "Strava API"
+_SOURCE_GARMIN = "Garmin GPX-kaust"
+_DEMO_DATA_KEY = "_vorm_demo_data_enabled"
 
-def _get_activities(source: str, uploaded_csv, days: int, cfg) -> list[TrainingActivity]:
-    if source == "Näidisandmed":
+
+def _get_activities(
+    source: str,
+    uploaded_csv,
+    days: int,
+    cfg,
+    *,
+    use_demo_data: bool = False,
+) -> list[TrainingActivity]:
+    if use_demo_data:
         return generate_sample_activities(days=days)
-    if source == "CSV-fail":
+    if source == _SOURCE_MANUAL:
+        return []
+    if source == _SOURCE_CSV:
         if uploaded_csv is None:
             return []
         try:
@@ -75,13 +90,12 @@ def _get_activities(source: str, uploaded_csv, days: int, cfg) -> list[TrainingA
         except Exception as exc:
             st.error(f"CSV-i lugemine ebaõnnestus: {exc}")
             return []
-    if source == "Garmin GPX-kaust":
+    if source == _SOURCE_GARMIN:
         folder = st.session_state.get("garmin_folder", "").strip()
         if not folder:
             st.info("Sisesta vasakul Garmin GPX-i ekspordi kausta tee.")
             return []
-        from pathlib import Path as _P
-        path = _P(folder)
+        path = Path(folder)
         if not path.is_dir():
             st.error(f"Kaust '{folder}' ei eksisteeri. Eksporti Garmin Connectist GPX-failid sellesse kausta.")
             return []
@@ -90,7 +104,7 @@ def _get_activities(source: str, uploaded_csv, days: int, cfg) -> list[TrainingA
         except Exception as exc:
             st.error(f"GPX-failide lugemine ebaõnnestus: {exc}")
             return []
-    if source == "Strava API":
+    if source == _SOURCE_STRAVA:
         try:
             result = fetch_with_cache(
                 client_id=cfg.strava_client_id,
@@ -440,22 +454,46 @@ if auth_user or auth.is_guest():
     auth.render_sidebar_user_panel()
     st.sidebar.divider()
 
-data_source_options = ["Näidisandmed", "CSV-fail", "Garmin GPX-kaust"]
+data_source_options = [_SOURCE_MANUAL, _SOURCE_CSV, _SOURCE_GARMIN]
 if cfg.has_strava:
-    data_source_options.insert(2, "Strava API")  # Strava enne Garmin-fallback'it
+    data_source_options.insert(2, _SOURCE_STRAVA)  # Strava enne Garmin-fallback'it
 
-# index=0 → "Näidisandmed" on cloud-demo-sõbralik default; ükski tegelik isiku-
-# andmestik pole vajalik, et UI demoks ette valmistada.
 source = st.sidebar.radio(
     "Andmeallikas",
     data_source_options,
     index=0,
-    help="Cloud-demo: alusta 'Näidisandmed'-iga. Oma andmete jaoks vajad lokaalset käivitust + .env-faili.",
+    help=(
+        "Käsitsi lisamine alustab tühjalt. Demo jaoks kasuta all olevat "
+        "nuppu; oma andmete jaoks lae CSV või ühenda andmeallikas."
+    ),
 )
-days = st.sidebar.slider("Päevade arv", min_value=28, max_value=180, value=90, step=7)
+days = st.sidebar.slider(
+    "Päevade arv",
+    min_value=28,
+    max_value=180,
+    value=90,
+    step=7,
+    help="Määrab demoandmete, Strava päringu ja ajaloovaadete akna pikkuse.",
+)
+
+if source != _SOURCE_MANUAL:
+    st.session_state[_DEMO_DATA_KEY] = False
+
+use_demo_data = source == _SOURCE_MANUAL and bool(st.session_state.get(_DEMO_DATA_KEY))
+if source == _SOURCE_MANUAL:
+    if use_demo_data:
+        st.sidebar.success(f"Demoandmed aktiivsed ({days} päeva).")
+        if st.sidebar.button("Tühjenda demoandmed", width="stretch"):
+            st.session_state[_DEMO_DATA_KEY] = False
+            st.rerun()
+    else:
+        st.sidebar.caption("Käsitsi lisamine alustab ilma treeningandmeteta.")
+        if st.sidebar.button("Täida demoandmetega", width="stretch"):
+            st.session_state[_DEMO_DATA_KEY] = True
+            st.rerun()
 
 uploaded_csv = None
-if source == "CSV-fail":
+if source == _SOURCE_CSV:
     uploaded_csv = st.sidebar.file_uploader(
         "Lae Strava-eksport või natiivformaadis CSV",
         type=["csv"],
@@ -463,7 +501,7 @@ if source == "CSV-fail":
         "Strava-eksport (Activity Date, Distance jne) töötab samuti.",
     )
 
-if source == "Garmin GPX-kaust":
+if source == _SOURCE_GARMIN:
     st.sidebar.text_input(
         "Garmin GPX-i ekspordi kaust",
         key="garmin_folder",
@@ -480,7 +518,7 @@ _autosave_profile(profile)
 # Load activities before the date picker so we can default the date to the
 # latest activity. Otherwise picking today() on a stale dataset shows
 # ACWR=0/TRIMP=0 because the 7-day window is empty.
-activities = _get_activities(source, uploaded_csv, days, cfg)
+activities = _get_activities(source, uploaded_csv, days, cfg, use_demo_data=use_demo_data)
 latest_activity_date = max((a.activity_date for a in activities), default=None)
 
 # Reset the widget's session_state when (a) it has never been set, or (b) the
@@ -529,7 +567,13 @@ with st.container(border=True):
     )
 
 if not activities:
-    st.info("Andmed pole veel laaditud. Vali vasakul andmeallikas või lae CSV.")
+    if source == _SOURCE_MANUAL:
+        st.info(
+            "Käsitsi lisamine alustab tühjalt. Lae vasakult CSV, ühenda andmeallikas "
+            "või vajuta **Täida demoandmetega**, et näidist kohe proovida."
+        )
+    else:
+        st.info("Andmed pole veel laaditud. Kontrolli vasakul valitud andmeallikat või lae CSV.")
     st.stop()
 
 if analysis_date > latest_activity_date:
@@ -590,12 +634,12 @@ with tab1:
             placeholder="Nt: 8×400 m 75 s pauside vahel; või 45 min kerge aeroobne.",
             height=100,
         )
-        colA, colB = st.columns(2)
-        rpe_yesterday = colA.slider("Eilse treeningu RPE (1–10)", min_value=1, max_value=10, value=5)
-        sleep_hours = colB.number_input("Uneaeg (h)", min_value=0.0, max_value=14.0, value=7.5, step=0.5)
-        colC, colD = st.columns(2)
-        stress = colC.slider("Stressitase (1–5)", min_value=1, max_value=5, value=2)
-        illness = colD.checkbox("Haigus / tundsin end halvasti")
+        col_a, col_b = st.columns(2)
+        rpe_yesterday = col_a.slider("Eilse treeningu RPE (1–10)", min_value=1, max_value=10, value=5)
+        sleep_hours = col_b.number_input("Uneaeg (h)", min_value=0.0, max_value=14.0, value=7.5, step=0.5)
+        col_c, col_d = st.columns(2)
+        stress = col_c.slider("Stressitase (1–5)", min_value=1, max_value=5, value=2)
+        illness = col_d.checkbox("Haigus / tundsin end halvasti")
         notes = st.text_input("Märkmed (valikuline)", placeholder="Nt: kerge köha, jalg pinges...")
 
     with c2:
@@ -783,10 +827,10 @@ with tab4:
             retro_verdict = evaluate_safety_rules(retro_summary, retro_subjective)
 
             st.markdown(f"#### Seis {retro_date.isoformat()} kohta")
-            colA, colB, colC = st.columns(3)
-            colA.metric("ACWR", f"{retro_summary.acwr:.2f}" if retro_summary.acwr else "—")
-            colB.metric("7 p TRIMP", f"{retro_summary.acute_7d:.0f}")
-            colC.metric("28 p TRIMP", f"{retro_summary.chronic_28d:.0f}")
+            col_a, col_b, col_c = st.columns(3)
+            col_a.metric("ACWR", f"{retro_summary.acwr:.2f}" if retro_summary.acwr else "—")
+            col_b.metric("7 p TRIMP", f"{retro_summary.acute_7d:.0f}")
+            col_c.metric("28 p TRIMP", f"{retro_summary.chronic_28d:.0f}")
 
             retro_llm = None
             if cfg.has_llm and retro_plan.strip():
@@ -849,7 +893,12 @@ with tab5:
         weeks_between = (event_date - plan_start_date).days // 7
         st.caption(f"Plaani pikkus: **{weeks_between} nädalat**, {weeks_between * 7} seansi-kirjet.")
 
-        if st.button("Genereeri treeningkava", type="primary", width="stretch", key="plan_generate"):
+        if st.button(
+            "Genereeri treeningkava",
+            type="primary",
+            width="stretch",
+            key="plan_generate",
+        ):
             goal = PlanGoal(
                 event_name=event_name,
                 distance_km=float(distance_km),
