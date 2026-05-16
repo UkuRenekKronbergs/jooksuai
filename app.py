@@ -59,9 +59,11 @@ from vorm.planning import PlanGenerationError, PlanGoal, generate_training_plan
 from vorm.rules import evaluate_safety_rules
 from vorm.ui import (
     acwr_chart,
+    apply_theme,
     daily_load_chart,
     fitness_form_chart,
     pb_progression_chart,
+    render_theme_selector,
     rpe_trend_chart,
     weekly_volume_chart,
 )
@@ -73,6 +75,10 @@ if __name__ == "__main__" and not st.runtime.exists():
     raise SystemExit(stcli.main())
 
 st.set_page_config(page_title="Vorm.ai — treeningkoormuse analüüsija", page_icon="🏃", layout="wide")
+
+# Inject the active theme's CSS as early as possible so it applies before
+# the rest of the page renders (avoids a light-mode flash on dark-theme loads).
+apply_theme()
 
 _SOURCE_MANUAL = "Käsitsi lisamine"
 _SOURCE_CSV = "CSV-fail"
@@ -966,6 +972,9 @@ if cfg.has_llm:
     st.sidebar.success(f"LLM aktiivne: {cfg.llm_provider} / {cfg.llm_model}")
 else:
     st.sidebar.info("LLM pole seadistatud — reeglivastus kuvatakse. Lisa ANTHROPIC_API_KEY .env-i täieliku analüüsi jaoks.")
+
+st.sidebar.divider()
+render_theme_selector(container=st.sidebar)
 
 st.sidebar.divider()
 st.sidebar.markdown(

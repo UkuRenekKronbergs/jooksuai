@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 from .config import load_config
 from .data.supabase_store import SupabaseNotConfigured, SupabaseStore
@@ -229,7 +228,9 @@ def _surface_auth_hash_params() -> None:
     converts only auth-related recovery fragments into query params, and the
     Python code clears them as soon as it consumes the session.
     """
-    components.html(
+    # `st.iframe` auto-detects raw HTML (no scheme / path prefix) and is the
+    # Streamlit 1.57+ replacement for the deprecated `components.html`.
+    st.iframe(
         """
 <script>
 (() => {
