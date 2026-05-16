@@ -43,8 +43,8 @@ def generate_recommendation(prompt: PromptBundle, config: Config) -> LLMRecommen
     if not config.has_llm:
         raise LLMNotAvailable(
             f"No credentials for provider '{config.llm_provider}'. "
-            "Set ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY in .env, "
-            "or switch the UI to metrics-only mode."
+            "Set ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / "
+            "GOOGLE_API_KEY in .env, or switch the UI to metrics-only mode."
         )
 
     if config.llm_provider == "anthropic":
@@ -53,6 +53,8 @@ def generate_recommendation(prompt: PromptBundle, config: Config) -> LLMRecommen
         return _generate_openai(prompt, config)
     if config.llm_provider == "openrouter":
         return _generate_openrouter(prompt, config)
+    if config.llm_provider == "google":
+        return _generate_google(prompt, config)
     raise LLMNotAvailable(f"Unknown provider: {config.llm_provider}")
 
 
@@ -230,6 +232,64 @@ def _generate_openai_retry(prompt: PromptBundle, config: Config, error: str) -> 
         ],
     )
     return response.choices[0].message.content or ""
+
+
+def _generate_google(prompt: PromptBundle, config: Config) -> LLMRecommendation:
+    """Native Google AI Studio (Gemini) backend via google-genai SDK.
+
+    Uses Gemini's `response_mime_type="application/json"` so the model returns
+    a JSON-only body — no parser tolerance needed for the happy path. On parse
+    failure we still retry once with an explicit reminder, mirroring the other
+    backends.
+
+    Free tier (15 RPM, 1500 RPD on Flash-Lite) is generous enough for the
+    full 45-day validation run without rate-limit handling. Get your key:
+    https://aistudio.google.com/app/apikey
+    """
+    try:
+        from google import genai
+        from google.genai import types as genai_types
+    except ImportError as exc:
+        raise LLMNotAvailable(
+            "google-genai SDK not installed — run `pip install google-genai`"
+        ) from exc
+
+    client = genai.Client(api_key=config.google_api_key)
+    gen_config = genai_types.GenerateContentConfig(
+        system_instruction=prompt.system,
+        temperature=config.llm_temperature,
+        response_mime_type="application/json",
+    )
+    response = client.models.generate_content(
+        model=config.llm_model,
+        contents=prompt.user,
+        config=gen_config,
+    )
+    text = response.text or ""
+
+    def _retry(prompt: PromptBundle, config: Config, error: str) -> str:
+        retry_user = (
+            f"{prompt.user}\n\n"
+            f"EELMINE VÄLJUND EI PARSITUD ({error}). "
+            "Anna AINULT kehtiv JSON, mis vastab skeemile — mitte midagi muud."
+        )
+        retry_resp = client.models.generate_content(
+            model=config.llm_model,
+            contents=retry_user,
+            config=gen_config,
+        )
+        return retry_resp.text or ""
+
+    parsed = _parse_json_with_retry(text, client, prompt, config, _retry)
+    usage = getattr(response, "usage_metadata", None)
+    return _build_recommendation(
+        parsed,
+        raw_text=text,
+        model=config.llm_model,
+        prompt_version=prompt.version,
+        input_tokens=getattr(usage, "prompt_token_count", None) if usage else None,
+        output_tokens=getattr(usage, "candidates_token_count", None) if usage else None,
+    )
 
 
 def _parse_json_with_retry(text: str, _client, prompt: PromptBundle, config: Config, retry_fn) -> dict:

@@ -84,6 +84,7 @@ class Config:
     anthropic_api_key: str | None
     openai_api_key: str | None
     openrouter_api_key: str | None
+    google_api_key: str | None
     strava_client_id: str | None
     strava_client_secret: str | None
     strava_refresh_token: str | None
@@ -104,6 +105,10 @@ class Config:
         return bool(self.openrouter_api_key)
 
     @property
+    def has_google(self) -> bool:
+        return bool(self.google_api_key)
+
+    @property
     def has_strava(self) -> bool:
         return bool(
             self.strava_client_id
@@ -119,6 +124,8 @@ class Config:
             return self.has_openai
         if self.llm_provider == "openrouter":
             return self.has_openrouter
+        if self.llm_provider == "google":
+            return self.has_google
         return False
 
 
@@ -128,16 +135,23 @@ _DEFAULT_MODEL_BY_PROVIDER = {
     # OpenRouter proxies many models — default to Claude via Anthropic's route.
     # Full catalog: https://openrouter.ai/models
     "openrouter": "anthropic/claude-sonnet-4.6",
+    # Google AI Studio: free tier 15 RPM, 1500 RPD on Flash-Lite models.
+    # Get key from https://aistudio.google.com/app/apikey
+    "google": "gemini-3.1-flash-lite",
 }
 
 
 def load_config() -> Config:
     provider = (_get("LLM_PROVIDER") or "anthropic").lower()
     default_model = _DEFAULT_MODEL_BY_PROVIDER.get(provider, "claude-sonnet-4-6")
+    # Accept either GOOGLE_API_KEY (AI Studio's canonical name) or GEMINI_API_KEY
+    # (the genai SDK's auto-pickup name) — both are common in the wild.
+    google_key = _get("GOOGLE_API_KEY") or _get("GEMINI_API_KEY")
     return Config(
         anthropic_api_key=_get("ANTHROPIC_API_KEY") or None,
         openai_api_key=_get("OPENAI_API_KEY") or None,
         openrouter_api_key=_get("OPENROUTER_API_KEY") or None,
+        google_api_key=google_key or None,
         strava_client_id=_get("STRAVA_CLIENT_ID") or None,
         strava_client_secret=_get("STRAVA_CLIENT_SECRET") or None,
         strava_refresh_token=_get("STRAVA_REFRESH_TOKEN") or None,
