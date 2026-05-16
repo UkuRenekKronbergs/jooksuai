@@ -12,6 +12,7 @@ import sys
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -74,6 +75,66 @@ def test_cold_cache_fetches_full_window(tmp_path, fake_stravalib):
     assert after_arg == expected_min
 
 
+def test_build_authorization_url_contains_scope_and_state():
+    from vorm.data.strava import build_authorization_url
+
+    url = build_authorization_url(
+        client_id="123",
+        redirect_uri="http://localhost:8501",
+        state="vorm-strava-state",
+    )
+
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    assert parsed.netloc == "www.strava.com"
+    assert query["client_id"] == ["123"]
+    assert query["redirect_uri"] == ["http://localhost:8501"]
+    assert query["response_type"] == ["code"]
+    assert query["scope"] == ["read,activity:read_all"]
+    assert query["state"] == ["vorm-strava-state"]
+
+
+def test_exchange_code_for_token_maps_strava_response(monkeypatch):
+    from vorm.data.strava import exchange_code_for_token
+
+    calls = []
+
+    class FakeResponse:
+        ok = True
+
+        def json(self):
+            return {
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_at": 1770000000,
+                "scope": "read,activity:read_all",
+                "athlete": {
+                    "id": 42,
+                    "firstname": "Uku",
+                    "lastname": "Kronbergs",
+                },
+            }
+
+    def fake_post(url, *, data, timeout):
+        calls.append((url, data, timeout))
+        return FakeResponse()
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    token = exchange_code_for_token(
+        client_id="123",
+        client_secret="secret",
+        code="callback-code",
+    )
+
+    assert token.refresh_token == "refresh"
+    assert token.access_token == "access"
+    assert token.athlete_id == "42"
+    assert token.athlete_name == "Uku Kronbergs"
+    assert calls[0][1]["grant_type"] == "authorization_code"
+    assert calls[0][1]["code"] == "callback-code"
+
+
 def test_warm_cache_only_asks_for_delta(tmp_path, fake_stravalib):
     """Cached up to May 10 → query Strava `after = May 9` (one-day backstep)."""
     from vorm.data.strava import fetch_with_cache
@@ -118,6 +179,29 @@ def test_warm_cache_only_asks_for_delta(tmp_path, fake_stravalib):
     # The edited name should have been persisted via upsert.
     edited = next(a for a in result.activities if a.id == "a2")
     assert edited.notes == "Edited name"
+
+
+def test_fetch_with_cache_surfaces_rotated_refresh_token(tmp_path, fake_stravalib):
+    from vorm.data.strava import fetch_with_cache
+
+    fake_stravalib.client.refresh_access_token.return_value = {
+        "access_token": "fake-token",
+        "refresh_token": "rotated-refresh",
+    }
+    fake_stravalib.client.get_activities.return_value = [
+        _fake_activity(id="a1", day=date(2026, 5, 1)),
+    ]
+
+    result = fetch_with_cache(
+        client_id="1",
+        client_secret="x",
+        refresh_token="old-refresh",
+        cache_db=tmp_path / "store.db",
+        days=60,
+        today=date(2026, 5, 16),
+    )
+
+    assert result.refresh_token == "rotated-refresh"
 
 
 def test_api_failure_falls_back_to_cache(tmp_path, fake_stravalib):

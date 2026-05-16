@@ -37,25 +37,22 @@ source .venv/bin/activate           # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 pip install -e .                    # registreerib `vorm` paketi Pythoni teele
 
-# 3. (Valikuline) LLM ja Strava võtmed
+# 3. (Valikuline) LLM võtmed
 cp .env.example .env
 # Sisesta üks järgmistest: ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY.
 # Provideri valimiseks sea LLM_PROVIDER=anthropic|openai|openrouter (vaikimisi: anthropic).
 # Mudeli valimiseks sea LLM_MODEL (nt openrouter puhul: anthropic/claude-sonnet-4.6,
 # deepseek/deepseek-v4-flash, meta-llama/llama-3.3-70b-instruct jne).
 
-# 4. (Valikuline) Strava OAuth — üks kord, produceerib refresh_tokeni
-python scripts/strava_bootstrap.py
-
-# 5. Käivita
+# 4. Käivita
 streamlit run app.py
 ```
 
-Esimesel käivitamisel on andmeallikas **Käsitsi lisamine** ja vaade algab tühjalt. Demo proovimiseks vajuta sidebar'is **Täida demoandmetega** — 90 päeva deterministlikult genereeritud näidisjooksu valmistavad terve UI demoks ette. Ilma LLM-võtmeta jookseb kõik peale soovituse teksti — ACWR, graafikud ja reeglitepõhine vastus töötavad ka offline.
+Esimesel käivitamisel on andmeallikas **Käsitsi lisamine** ja vaade algab tühjalt. Demo proovimiseks vajuta sidebar'is **Täida demoandmetega** — 90 päeva deterministlikult genereeritud näidisjooksu valmistavad terve UI demoks ette. Strava ühendamiseks vali sidebar'is **Strava API**, sisesta oma Strava API rakenduse **Client ID** ja **Client Secret** ning luba treeningute lugemine Strava lehel. Ilma LLM-võtmeta jookseb kõik peale soovituse teksti — ACWR, graafikud ja reeglitepõhine vastus töötavad ka offline.
 
 ### Strava-andmete vahemälu
 
-Kui valid sidebari **Strava API**, kasutab rakendus `fetch_with_cache()`-i: lokaalsesse SQLite-faili (`data/cache/activities.sqlite`) salvestatakse iga kunagi päritud treening. Igal järgneval käivitusel küsitakse Stravalt ainult delta (alates viimase cache-treeningu kuupäevast − 1 päev, et viimase päeva nimetuse muudatused korjata). API tõrke korral (429, võrk maas) tagastatakse vahemälu sisu — sünk ei kaota andmeid. Vt projekti plaan §5 Risk 2.
+Kui valid sidebari **Strava API**, kasutab rakendus `fetch_with_cache()`-i: lokaalsesse SQLite-faili (`data/cache/activities*.sqlite`) salvestatakse iga kunagi päritud treening. Igal järgneval käivitusel küsitakse Stravalt ainult delta (alates viimase cache-treeningu kuupäevast − 1 päev, et viimase päeva nimetuse muudatused korjata). API tõrke korral (429, võrk maas) tagastatakse vahemälu sisu — sünk ei kaota andmeid. Vt projekti plaan §5 Risk 2.
 
 ## Andmete formaat
 
@@ -109,7 +106,7 @@ src/vorm/
 app.py                       # Streamlit entry point
 scripts/
 ├── enrich_strava_with_polar.py   # CLI: Polari pulsiandmed Strava CSV-sse
-├── strava_bootstrap.py           # CLI: Strava OAuth refresh-token genereerimine
+├── strava_bootstrap.py           # CLI: legacy Strava refresh-token bootstrap
 └── validate.py                   # CLI: PROJECT_PLAN §4 valideerimisharness
 docs/
 ├── interview_script.md           # §4.4 kvalitatiivse intervjuu protokoll
@@ -209,10 +206,10 @@ Rakendus on cloud-deploy-valmis. Failisüsteemil ei pea olema kirjeldatud sõltu
    # LLM_MODEL = "claude-sonnet-4-6"
    # ANTHROPIC_API_KEY = "sk-ant-..."
    # OPENAI_API_KEY    = "sk-..."
-   # Strava (valikuline — ilma selleta peita "Strava API" valik UI-st):
+   # Strava (valikuline vana/admin voog — kasutaja saab selle nüüd ka UI-s ühendada):
    # STRAVA_CLIENT_ID     = "12345"
    # STRAVA_CLIENT_SECRET = "..."
-   # STRAVA_REFRESH_TOKEN = "..."  # genereeri lokaalselt: python scripts/strava_bootstrap.py
+   # STRAVA_REFRESH_TOKEN = "..."
    ```
 5. Saad URL-i kujul `https://vorm-ai.streamlit.app`.
 
@@ -222,7 +219,7 @@ Cloud-režiimis vaikimisi andmeallikas on **Käsitsi lisamine** ja see on tühi.
 
 - **Failisüsteem on efemeerne.** SQLite vahemälu (`data/cache/activities.sqlite`) kaob iga restardi peal — kuid sportlase profiil ja päevalogi saab püsima jätta läbi **Supabase-režiimi** (vt allpool). Anonüümses režiimis (ilma Supabase'ita) ka päevalogi efemeerne.
 - **App magab 7 päeva idle järel.** Esmase päringu cold-start ~30 s.
-- **Strava OAuth** — `scripts/strava_bootstrap.py` kasutab localhost:8000-i ega tööta cloud'is. Genereeri token lokaalselt, kleebi `STRAVA_REFRESH_TOKEN` Streamlit secrets'i.
+- **Strava OAuth** töötab nüüd veebis. Strava API rakenduse seadetes pane **Authorization Callback Domain** samaks domeeniks, mida sidebar kuvab (nt `vorm-ai.streamlit.app` või lokaalselt `localhost`).
 - **RAM ~1 GB.** Praegune sõltuvuste komplekt (Streamlit + pandas + scikit-learn) mahub ära ~400 MB peal.
 
 ### Konfiguratsiooni resolutsioon
@@ -241,9 +238,9 @@ Vaikimisi käivitub rakendus **anonüümses ühe-kasutaja režiimis** lokaalse S
 - **Sisselogimine** email + parooliga. Esmakordsel registreerumisel saadab Supabase kinnitusmaili — pärast lingile klikkimist pole kinnitamist enam vaja, ainult email + parool.
 - **Parooli taastamine** on login-väravas eraldi tabina olemas. Kasutaja saab taastamislingi emailile, avab lingi ja määrab uue parooli samas Streamlit rakenduses.
 - **Brauseri refresh ei logi välja.** Rakendus mäletab sisselogitud kasutajat serveriprotsessi sees Streamliti brauseri-cookie sõrmejälje järgi ja taastab Supabase sessiooni refresh-tokeniga. Serveri restart/redeploy nõuab uuesti sisselogimist.
-- **Sportlase profiil** ja **päevalogi** salvestuvad pilve — säilivad redeploy'de vahel, näha igast seadmest. Profiil **salvestub automaatselt** kui väärtusi muudad.
+- **Sportlase profiil**, **päevalogi** ja **Strava ühendus** salvestuvad pilve — säilivad redeploy'de vahel, näha igast seadmest. Profiil **salvestub automaatselt** kui väärtusi muudad.
 - **Row-Level Security** — iga kasutaja näeb ainult enda andmeid; PostgreSQL võtab vastutuse, mitte rakenduse-kood.
-- **Strava-vahemälu** jääb endiselt lokaalseks SQLite'iks (see on per-deployment HTTP-cache, mitte kasutaja andmed).
+- **Strava-vahemälu** jääb endiselt lokaalseks SQLite'iks, aga cache-fail on kasutaja/ühenduse järgi eristatud.
 
 ### Seadistamine
 
@@ -267,8 +264,8 @@ Eemalda `SUPABASE_URL` ja `SUPABASE_ANON_KEY` env-ist või Streamlit secrets'ist
 ## Privaatsus
 
 - Treeningandmed (GPS-punktid, tooraine pulsiribaread) **ei** liigu LLM-pakkuja serverisse — LLM näeb ainult agregeeritud näitajaid ja metaandmeid.
-- Strava refresh token hoitakse lokaalses `.env`-failis (gitignored) või Streamlit secrets'is — mitte kunagi commit'is.
-- **Multi-user režiimis** (Supabase) — profiil + päevalogi salvestub pilve, Row-Level Security tagab, et iga kasutaja näeb ainult enda andmeid. Anon-võti on disainilt avalik (kaitstud RLS-iga); `service_role` võtit rakendus ei kasuta.
+- Strava ühendus hoitakse lokaalses SQLite'is või Supabase multi-user režiimis kasutaja enda `strava_connections` reas. `.env` / Streamlit secrets voog töötab endiselt admin-seadistusena, aga võtmeid ei tohi commit'ida.
+- **Multi-user režiimis** (Supabase) — profiil, päevalogi ja Strava ühendus salvestuvad pilve, Row-Level Security tagab, et iga kasutaja näeb ainult enda andmeid. Anon-võti on disainilt avalik (kaitstud RLS-iga); `service_role` võtit rakendus ei kasuta.
 
 ## Vastutuspiir
 

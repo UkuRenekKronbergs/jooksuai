@@ -41,6 +41,16 @@ class DailySubjective:
 
 
 @dataclass(frozen=True)
+class StravaConnection:
+    client_id: str
+    client_secret: str = field(repr=False)
+    refresh_token: str = field(repr=False)
+    athlete_id: str | None = None
+    athlete_name: str = ""
+    scope: str = ""
+
+
+@dataclass(frozen=True)
 class AthleteProfile:
     name: str
     age: int

@@ -13,9 +13,14 @@ from __future__ import annotations
 
 import hashlib
 import io
+import secrets
 import sys
+import time
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
+from threading import RLock
+from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
 import streamlit as st
@@ -25,6 +30,7 @@ from vorm.config import CACHE_DIR, load_config
 from vorm.data import (
     AthleteProfile,
     DailySubjective,
+    StravaConnection,
     TrainingActivity,
     generate_sample_activities,
     load_sample_profile,
@@ -32,7 +38,13 @@ from vorm.data import (
 from vorm.data.csv_loader import load_activities_csv
 from vorm.data.garmin import parse_gpx_folder
 from vorm.data.storage import ActivityStore, DailyLogEntry
-from vorm.data.strava import StravaNotConfigured, fetch_with_cache
+from vorm.data.strava import (
+    STRAVA_ACTIVITY_SCOPE,
+    StravaNotConfigured,
+    build_authorization_url,
+    exchange_code_for_token,
+    fetch_with_cache,
+)
 from vorm.llm import LLMNotAvailable, build_prompt, generate_recommendation
 from vorm.metrics import (
     PB_DISTANCES,
@@ -67,6 +79,219 @@ _SOURCE_CSV = "CSV-fail"
 _SOURCE_STRAVA = "Strava API"
 _SOURCE_GARMIN = "Garmin GPX-kaust"
 _DEMO_DATA_KEY = "_vorm_demo_data_enabled"
+_DATA_SOURCE_KEY = "_vorm_data_source"
+_STRAVA_CONNECTION_KEY = "_vorm_strava_connection"
+_STRAVA_AUTH_URL_KEY = "_vorm_strava_auth_url"
+_STRAVA_AUTH_STATE_KEY = "_vorm_strava_auth_state"
+_STRAVA_DISABLE_ENV_KEY = "_vorm_strava_disable_env_connection"
+_STRAVA_PENDING_TTL_SECONDS = 15 * 60
+_STRAVA_CALLBACK_KEYS = ("code", "scope", "state", "error", "error_description")
+
+
+@st.cache_resource
+def _strava_pending_registry() -> dict:
+    return {"lock": RLock(), "pending": {}}
+
+
+def _remember_pending_strava_oauth(
+    state: str,
+    *,
+    client_id: str,
+    client_secret: str,
+) -> None:
+    registry = _strava_pending_registry()
+    with registry["lock"]:
+        _prune_pending_strava_oauth(registry["pending"])
+        registry["pending"][state] = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "created_at": time.time(),
+        }
+
+
+def _pop_pending_strava_oauth(state: str) -> dict | None:
+    registry = _strava_pending_registry()
+    with registry["lock"]:
+        _prune_pending_strava_oauth(registry["pending"])
+        return registry["pending"].pop(state, None)
+
+
+def _prune_pending_strava_oauth(pending: dict) -> None:
+    cutoff = time.time() - _STRAVA_PENDING_TTL_SECONDS
+    for key, value in list(pending.items()):
+        if value.get("created_at", 0) < cutoff:
+            pending.pop(key, None)
+
+
+def _query_param(name: str) -> str | None:
+    try:
+        value = st.query_params.get(name)
+    except Exception:
+        return None
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if value is None:
+        return None
+    return str(value)
+
+
+def _clear_strava_query_params() -> None:
+    try:
+        remaining = dict(st.query_params)
+        for key in _STRAVA_CALLBACK_KEYS:
+            remaining.pop(key, None)
+        st.query_params.clear()
+        for key, value in remaining.items():
+            st.query_params[key] = value
+    except Exception:
+        pass
+
+
+def _current_app_url() -> str:
+    try:
+        raw_url = str(st.context.url or "")
+    except Exception:
+        raw_url = ""
+    if not raw_url:
+        return "http://localhost:8501"
+    parts = urlsplit(raw_url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def _strava_callback_domain() -> str:
+    host = urlsplit(_current_app_url()).hostname or "localhost"
+    return host
+
+
+def _load_saved_strava_connection(cfg) -> StravaConnection | None:
+    cached = st.session_state.get(_STRAVA_CONNECTION_KEY)
+    if isinstance(cached, StravaConnection):
+        return cached
+
+    try:
+        saved = _get_user_store().load_strava_connection()
+    except Exception:
+        saved = None
+    if saved:
+        st.session_state[_STRAVA_CONNECTION_KEY] = saved
+        return saved
+
+    if cfg.has_strava and not st.session_state.get(_STRAVA_DISABLE_ENV_KEY):
+        connection = StravaConnection(
+            client_id=cfg.strava_client_id or "",
+            client_secret=cfg.strava_client_secret or "",
+            refresh_token=cfg.strava_refresh_token or "",
+            athlete_name="seadistatud .env / secrets kaudu",
+            scope=STRAVA_ACTIVITY_SCOPE,
+        )
+        st.session_state[_STRAVA_CONNECTION_KEY] = connection
+        return connection
+    return None
+
+
+def _save_strava_connection(
+    connection: StravaConnection,
+    *,
+    surface_errors: bool = True,
+) -> None:
+    st.session_state.pop(_STRAVA_DISABLE_ENV_KEY, None)
+    st.session_state[_STRAVA_CONNECTION_KEY] = connection
+    try:
+        _get_user_store().save_strava_connection(connection)
+    except Exception as exc:
+        if surface_errors:
+            st.sidebar.warning(
+                f"Strava ühendus töötab selles sessioonis, aga püsiv salvestus ebaõnnestus: {exc}",
+                icon="⚠️",
+            )
+
+
+def _delete_strava_connection(*, disable_env: bool = False) -> None:
+    st.session_state.pop(_STRAVA_CONNECTION_KEY, None)
+    st.session_state.pop(_STRAVA_AUTH_URL_KEY, None)
+    st.session_state.pop(_STRAVA_AUTH_STATE_KEY, None)
+    if disable_env:
+        st.session_state[_STRAVA_DISABLE_ENV_KEY] = True
+    try:
+        _get_user_store().delete_strava_connection()
+    except Exception:
+        pass
+
+
+def _consume_strava_oauth_callback() -> None:
+    state = _query_param("state")
+    if not state or not state.startswith("vorm-strava-"):
+        return
+
+    error = _query_param("error_description") or _query_param("error")
+    if error:
+        st.sidebar.error(f"Strava autoriseerimine katkestati: {error}")
+        _clear_strava_query_params()
+        return
+
+    code = _query_param("code")
+    if not code:
+        st.sidebar.error("Strava ei tagastanud autoriseerimiskoodi. Proovi uuesti.")
+        _clear_strava_query_params()
+        return
+
+    pending = _pop_pending_strava_oauth(state)
+    if not pending:
+        st.sidebar.error("Strava ühendamise sessioon aegus. Alusta ühendamist uuesti.")
+        _clear_strava_query_params()
+        return
+
+    try:
+        token = exchange_code_for_token(
+            client_id=pending["client_id"],
+            client_secret=pending["client_secret"],
+            code=code,
+        )
+    except Exception as exc:
+        st.sidebar.error(f"Strava tokeni vahetus ebaõnnestus: {exc}")
+        _clear_strava_query_params()
+        return
+
+    granted_scope = _query_param("scope") or token.scope
+    connection = StravaConnection(
+        client_id=pending["client_id"],
+        client_secret=pending["client_secret"],
+        refresh_token=token.refresh_token,
+        athlete_id=token.athlete_id,
+        athlete_name=token.athlete_name,
+        scope=granted_scope,
+    )
+    _save_strava_connection(connection)
+    st.session_state[_DATA_SOURCE_KEY] = _SOURCE_STRAVA
+    st.session_state.pop(_STRAVA_AUTH_URL_KEY, None)
+    st.session_state.pop(_STRAVA_AUTH_STATE_KEY, None)
+    _clear_strava_query_params()
+    st.sidebar.success("Strava ühendatud. Tõmban treeningud.")
+    st.rerun()
+
+
+def _strava_cache_db(connection: StravaConnection, cfg) -> Path:
+    if (
+        cfg.has_strava
+        and connection.athlete_id is None
+        and connection.client_id == cfg.strava_client_id
+    ):
+        return CACHE_DIR / "activities.sqlite"
+
+    user = auth.current_user()
+    identity = (
+        f"user:{user.id}" if user else connection.athlete_id or connection.client_id or "local"
+    )
+    suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    return CACHE_DIR / f"activities_strava_{suffix}.sqlite"
+
+
+def _is_env_strava_connection(connection: StravaConnection, cfg) -> bool:
+    return (
+        cfg.has_strava
+        and connection.athlete_id is None
+        and connection.client_id == cfg.strava_client_id
+    )
 
 
 def _get_activities(
@@ -75,6 +300,7 @@ def _get_activities(
     days: int,
     cfg,
     *,
+    strava_connection: StravaConnection | None = None,
     use_demo_data: bool = False,
 ) -> list[TrainingActivity]:
     if use_demo_data:
@@ -106,14 +332,22 @@ def _get_activities(
             st.error(f"GPX-failide lugemine ebaõnnestus: {exc}")
             return []
     if source == _SOURCE_STRAVA:
+        if strava_connection is None:
+            st.info("Ühenda vasakul Strava API, et treeningud automaatselt laadida.")
+            return []
         try:
             result = fetch_with_cache(
-                client_id=cfg.strava_client_id,
-                client_secret=cfg.strava_client_secret,
-                refresh_token=cfg.strava_refresh_token,
-                cache_db=CACHE_DIR / "activities.sqlite",
+                client_id=strava_connection.client_id,
+                client_secret=strava_connection.client_secret,
+                refresh_token=strava_connection.refresh_token,
+                cache_db=_strava_cache_db(strava_connection, cfg),
                 days=days,
             )
+            if result.refresh_token and result.refresh_token != strava_connection.refresh_token:
+                _save_strava_connection(
+                    replace(strava_connection, refresh_token=result.refresh_token),
+                    surface_errors=False,
+                )
             if result.api_called:
                 msg = f"Strava sünk: {result.fetched_from_api} uut + {result.cache_hits} vahemälust"
                 if result.latest_cached_date:
@@ -379,6 +613,98 @@ def _autosave_profile(profile: AthleteProfile) -> None:
     st.session_state[_PROFILE_CACHE_KEY] = profile
 
 
+def _render_strava_connection_panel(
+    source: str,
+    cfg,
+    connection: StravaConnection | None,
+) -> StravaConnection | None:
+    if source != _SOURCE_STRAVA:
+        return connection
+
+    st.sidebar.markdown("#### Strava ühendus")
+    if connection:
+        label = connection.athlete_name or f"Client ID {connection.client_id}"
+        st.sidebar.success(f"Ühendatud: {label}")
+        if "activity:read" not in (connection.scope or ""):
+            st.sidebar.warning(
+                "Strava luba ei sisalda `activity:read_all` õigust. Ühenda uuesti ja luba treeningute lugemine.",
+                icon="⚠️",
+            )
+        col1, col2 = st.sidebar.columns(2)
+        if col1.button("Ühenda uuesti", key="_vorm_strava_reconnect", width="stretch"):
+            _delete_strava_connection(
+                disable_env=_is_env_strava_connection(connection, cfg)
+            )
+            st.rerun()
+        if col2.button("Eemalda", key="_vorm_strava_disconnect", width="stretch"):
+            _delete_strava_connection(
+                disable_env=_is_env_strava_connection(connection, cfg)
+            )
+            st.rerun()
+        return connection
+
+    callback_domain = _strava_callback_domain()
+    redirect_uri = _current_app_url()
+    st.sidebar.info(
+        "Sisesta Strava API rakenduse Client ID ja Client Secret. "
+        "Seejärel suunan sind Stravasse luba andma."
+    )
+    st.sidebar.caption(
+        f"Strava API seadetes peab **Authorization Callback Domain** olema `{callback_domain}`."
+    )
+    with st.sidebar.form("vorm_strava_connect_form"):
+        client_id = st.text_input(
+            "Client ID",
+            value=cfg.strava_client_id or "",
+            key="_vorm_strava_client_id",
+            help="Leiad Strava lehelt Settings → My API Application.",
+        )
+        client_secret = st.text_input(
+            "Client Secret",
+            value="",
+            type="password",
+            key="_vorm_strava_client_secret",
+        )
+        submitted = st.form_submit_button("Valmista Strava ühendus", type="primary")
+        if submitted:
+            clean_client_id = (client_id or "").strip()
+            clean_secret = (client_secret or "").strip()
+            if not clean_client_id or not clean_secret:
+                st.sidebar.error("Client ID ja Client Secret on kohustuslikud.")
+            else:
+                try:
+                    state = f"vorm-strava-{secrets.token_urlsafe(18)}"
+                    url = build_authorization_url(
+                        client_id=clean_client_id,
+                        redirect_uri=redirect_uri,
+                        state=state,
+                        scope=STRAVA_ACTIVITY_SCOPE,
+                        approval_prompt="force",
+                    )
+                except Exception as exc:
+                    st.sidebar.error(str(exc))
+                else:
+                    _remember_pending_strava_oauth(
+                        state,
+                        client_id=clean_client_id,
+                        client_secret=clean_secret,
+                    )
+                    st.session_state[_STRAVA_AUTH_STATE_KEY] = state
+                    st.session_state[_STRAVA_AUTH_URL_KEY] = url
+
+    auth_url = st.session_state.get(_STRAVA_AUTH_URL_KEY)
+    if auth_url:
+        st.sidebar.link_button(
+            "Ava Strava autoriseerimine",
+            auth_url,
+            type="primary",
+            width="stretch",
+        )
+        st.sidebar.caption("Pärast luba andmist tuled automaatselt tagasi siia rakendusse.")
+
+    return None
+
+
 def _render_daily_log_form(
     log_day: date,
     recommended_category: str,
@@ -538,14 +864,16 @@ if auth_user or auth.is_guest():
     auth.render_sidebar_user_panel()
     st.sidebar.divider()
 
-data_source_options = [_SOURCE_MANUAL, _SOURCE_CSV, _SOURCE_GARMIN]
-if cfg.has_strava:
-    data_source_options.insert(2, _SOURCE_STRAVA)  # Strava enne Garmin-fallback'it
+_consume_strava_oauth_callback()
+strava_connection = _load_saved_strava_connection(cfg)
+
+data_source_options = [_SOURCE_MANUAL, _SOURCE_CSV, _SOURCE_STRAVA, _SOURCE_GARMIN]
 
 source = st.sidebar.radio(
     "Andmeallikas",
     data_source_options,
     index=0,
+    key=_DATA_SOURCE_KEY,
     help=(
         "Käsitsi lisamine alustab tühjalt. Demo jaoks kasuta all olevat "
         "nuppu; oma andmete jaoks lae CSV või ühenda andmeallikas."
@@ -594,6 +922,8 @@ if source == _SOURCE_GARMIN:
         "Project Plan §5 Risk 2 fallback Stravale.",
     )
 
+strava_connection = _render_strava_connection_panel(source, cfg, strava_connection)
+
 st.sidebar.divider()
 
 profile = _render_profile_editor(_load_initial_profile())
@@ -602,7 +932,14 @@ _autosave_profile(profile)
 # Load activities before the date picker so we can default the date to the
 # latest activity. Otherwise picking today() on a stale dataset shows
 # ACWR=0/TRIMP=0 because the 7-day window is empty.
-activities = _get_activities(source, uploaded_csv, days, cfg, use_demo_data=use_demo_data)
+activities = _get_activities(
+    source,
+    uploaded_csv,
+    days,
+    cfg,
+    strava_connection=strava_connection,
+    use_demo_data=use_demo_data,
+)
 has_activities = bool(activities)
 manual_without_history = source == _SOURCE_MANUAL and not has_activities
 latest_activity_date = max((a.activity_date for a in activities), default=None)

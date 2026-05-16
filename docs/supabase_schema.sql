@@ -3,9 +3,10 @@
 -- Käivita see üks kord:
 --   Supabase Dashboard → SQL Editor → New query → kleebi sisu → Run.
 --
--- Loob kaks kasutaja-skoobiga tabelit:
+-- Loob kolm kasutaja-skoobiga tabelit:
 --   - athlete_profiles  — sportlase profiil (üks rida per kasutaja)
 --   - daily_logs        — päeva-logi (Project Plan §4.3, üks rida per kasutaja+kuupäev)
+--   - strava_connections — kasutaja Strava OAuth seos (üks rida per kasutaja)
 --
 -- Mõlemal on Row-Level Security sees: iga kasutaja näeb / muudab AINULT
 -- enda ridu, isegi kui keegi peaks anon-võtmega päringuid manipuleerima.
@@ -59,6 +60,44 @@ $$;
 DROP TRIGGER IF EXISTS trg_profiles_updated_at ON public.athlete_profiles;
 CREATE TRIGGER trg_profiles_updated_at
     BEFORE UPDATE ON public.athlete_profiles
+    FOR EACH ROW EXECUTE FUNCTION public.tg_set_updated_at();
+
+
+-- ===== strava_connections ============================================
+CREATE TABLE IF NOT EXISTS public.strava_connections (
+    user_id       UUID        PRIMARY KEY
+                              REFERENCES auth.users(id)
+                              ON DELETE CASCADE,
+    client_id     TEXT        NOT NULL,
+    client_secret TEXT        NOT NULL,
+    refresh_token TEXT        NOT NULL,
+    athlete_id    TEXT,
+    athlete_name  TEXT,
+    scope         TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE public.strava_connections ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users select own Strava connection" ON public.strava_connections;
+DROP POLICY IF EXISTS "Users insert own Strava connection" ON public.strava_connections;
+DROP POLICY IF EXISTS "Users update own Strava connection" ON public.strava_connections;
+DROP POLICY IF EXISTS "Users delete own Strava connection" ON public.strava_connections;
+
+CREATE POLICY "Users select own Strava connection" ON public.strava_connections
+    FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users insert own Strava connection" ON public.strava_connections
+    FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users update own Strava connection" ON public.strava_connections
+    FOR UPDATE USING (auth.uid() = user_id)
+                WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users delete own Strava connection" ON public.strava_connections
+    FOR DELETE USING (auth.uid() = user_id);
+
+DROP TRIGGER IF EXISTS trg_strava_connections_updated_at ON public.strava_connections;
+CREATE TRIGGER trg_strava_connections_updated_at
+    BEFORE UPDATE ON public.strava_connections
     FOR EACH ROW EXECUTE FUNCTION public.tg_set_updated_at();
 
 

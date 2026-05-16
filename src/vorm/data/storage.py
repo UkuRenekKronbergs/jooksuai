@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from .models import AthleteProfile, TrainingActivity
+from .models import AthleteProfile, StravaConnection, TrainingActivity
 
 
 def _resolve_writable_db_path(preferred: Path) -> Path:
@@ -87,6 +87,17 @@ CREATE TABLE IF NOT EXISTS daily_log (
     next_session_feeling  INTEGER,   -- 1-5 subjective how the next session went
     notes                 TEXT,
     created_at            TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS strava_connection (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    client_id      TEXT NOT NULL,
+    client_secret  TEXT NOT NULL,
+    refresh_token  TEXT NOT NULL,
+    athlete_id     TEXT,
+    athlete_name   TEXT,
+    scope          TEXT,
+    updated_at     TEXT NOT NULL
 );
 """
 
@@ -208,6 +219,47 @@ class ActivityStore:
         data = json.loads(row["payload"])
         return AthleteProfile(**data)
 
+    # --- Strava OAuth connection -----------------------------------------
+
+    def save_strava_connection(self, connection: StravaConnection) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO strava_connection (
+                    id, client_id, client_secret, refresh_token,
+                    athlete_id, athlete_name, scope, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    client_id = excluded.client_id,
+                    client_secret = excluded.client_secret,
+                    refresh_token = excluded.refresh_token,
+                    athlete_id = excluded.athlete_id,
+                    athlete_name = excluded.athlete_name,
+                    scope = excluded.scope,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    connection.client_id,
+                    connection.client_secret,
+                    connection.refresh_token,
+                    connection.athlete_id,
+                    connection.athlete_name,
+                    connection.scope,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+
+    def load_strava_connection(self) -> StravaConnection | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM strava_connection WHERE id = 1"
+            ).fetchone()
+        return _row_to_strava_connection(row) if row else None
+
+    def delete_strava_connection(self) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM strava_connection WHERE id = 1")
+
     # --- Daily usage log (Project Plan §4.3) ------------------------------
 
     def save_daily_log(self, entry: DailyLogEntry) -> None:
@@ -311,4 +363,15 @@ def _row_to_activity(row: sqlite3.Row) -> TrainingActivity:
         elevation_gain_m=row["elevation_gain_m"],
         rpe=row["rpe"],
         notes=row["notes"],
+    )
+
+
+def _row_to_strava_connection(row: sqlite3.Row) -> StravaConnection:
+    return StravaConnection(
+        client_id=row["client_id"],
+        client_secret=row["client_secret"],
+        refresh_token=row["refresh_token"],
+        athlete_id=row["athlete_id"],
+        athlete_name=row["athlete_name"] or "",
+        scope=row["scope"] or "",
     )

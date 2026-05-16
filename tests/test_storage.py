@@ -6,7 +6,7 @@ from datetime import date
 
 import pytest
 
-from vorm.data.models import AthleteProfile, TrainingActivity
+from vorm.data.models import AthleteProfile, StravaConnection, TrainingActivity
 from vorm.data.storage import ActivityStore, DailyLogEntry
 
 
@@ -122,6 +122,37 @@ def test_daily_log_list_filters_by_range(tmp_path):
         ))
     in_range = store.list_daily_logs(since=date(2026, 5, 18), until=date(2026, 5, 24))
     assert [e.log_date for e in in_range] == [date(2026, 5, 18)]
+
+
+def test_strava_connection_roundtrip_and_delete(tmp_path):
+    store = ActivityStore(tmp_path / "store.db")
+    connection = StravaConnection(
+        client_id="123",
+        client_secret="secret",
+        refresh_token="refresh",
+        athlete_id="42",
+        athlete_name="Uku Kronbergs",
+        scope="read,activity:read_all",
+    )
+
+    store.save_strava_connection(connection)
+
+    loaded = store.load_strava_connection()
+    assert loaded == connection
+
+    rotated = StravaConnection(
+        client_id="123",
+        client_secret="secret",
+        refresh_token="refresh-2",
+        athlete_id="42",
+        athlete_name="Uku Kronbergs",
+        scope="read,activity:read_all",
+    )
+    store.save_strava_connection(rotated)
+    assert store.load_strava_connection() == rotated
+
+    store.delete_strava_connection()
+    assert store.load_strava_connection() is None
 
 
 def test_falls_back_to_tempdir_on_permission_error(tmp_path, monkeypatch):

@@ -22,13 +22,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlencode
 
 from .models import TrainingActivity
 from .storage import ActivityStore
 
+STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
+STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
+STRAVA_ACTIVITY_SCOPE = "read,activity:read_all"
+
 
 class StravaNotConfigured(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class StravaOAuthToken:
+    refresh_token: str
+    access_token: str
+    expires_at: int | None = None
+    athlete_id: str | None = None
+    athlete_name: str = ""
+    scope: str = ""
 
 
 @dataclass(frozen=True)
@@ -46,6 +61,84 @@ class StravaSyncResult:
     cache_hits: int
     latest_cached_date: date | None
     api_called: bool
+    refresh_token: str | None = None
+
+
+def build_authorization_url(
+    *,
+    client_id: str,
+    redirect_uri: str,
+    state: str,
+    scope: str = STRAVA_ACTIVITY_SCOPE,
+    approval_prompt: str = "auto",
+) -> str:
+    """Build the Strava OAuth URL for a browser-based authorization flow."""
+    if not client_id:
+        raise StravaNotConfigured("Strava Client ID puudub.")
+    if not redirect_uri:
+        raise StravaNotConfigured("Strava tagasisuuna URL-i ei õnnestunud määrata.")
+    if not str(client_id).isdigit():
+        raise StravaNotConfigured("Strava Client ID peab olema number.")
+    params = {
+        "client_id": str(client_id).strip(),
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "approval_prompt": approval_prompt,
+        "scope": scope,
+        "state": state,
+    }
+    return f"{STRAVA_AUTHORIZE_URL}?{urlencode(params)}"
+
+
+def exchange_code_for_token(
+    *,
+    client_id: str,
+    client_secret: str,
+    code: str,
+    timeout: int = 30,
+) -> StravaOAuthToken:
+    """Exchange Strava's temporary authorization code for reusable tokens."""
+    if not (client_id and client_secret and code):
+        raise StravaNotConfigured("Strava Client ID, Client Secret ja kood on kohustuslikud.")
+    if not str(client_id).isdigit():
+        raise StravaNotConfigured("Strava Client ID peab olema number.")
+    try:
+        import requests  # noqa: PLC0415
+    except ImportError as exc:
+        raise RuntimeError("requests pole installitud — jooksuta `pip install -r requirements.txt`.") from exc
+
+    response = requests.post(
+        STRAVA_TOKEN_URL,
+        data={
+            "client_id": str(client_id).strip(),
+            "client_secret": client_secret,
+            "code": code,
+            "grant_type": "authorization_code",
+        },
+        timeout=timeout,
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"Strava token-vahetus ebaõnnestus: {response.status_code} {response.text}"
+        )
+    payload = response.json()
+    refresh_token = payload.get("refresh_token")
+    access_token = payload.get("access_token")
+    if not (refresh_token and access_token):
+        raise RuntimeError("Strava vastusest puudus access_token või refresh_token.")
+
+    athlete = payload.get("athlete") or {}
+    athlete_name = " ".join(
+        part for part in (athlete.get("firstname"), athlete.get("lastname")) if part
+    )
+    return StravaOAuthToken(
+        refresh_token=str(refresh_token),
+        access_token=str(access_token),
+        expires_at=payload.get("expires_at"),
+        athlete_id=str(athlete["id"]) if athlete.get("id") is not None else None,
+        athlete_name=athlete_name,
+        scope=str(payload.get("scope") or ""),
+    )
 
 
 def fetch_recent_activities(
@@ -60,7 +153,7 @@ def fetch_recent_activities(
         raise StravaNotConfigured(
             "Strava credentials missing — set STRAVA_CLIENT_ID / _SECRET / _REFRESH_TOKEN in .env"
         )
-    client = _authed_client(client_id, client_secret, refresh_token)
+    client, _latest_refresh_token = _authed_client(client_id, client_secret, refresh_token)
     after = datetime.now(UTC) - timedelta(days=days)
     return list(_pull_runs_after(client, after))
 
@@ -108,8 +201,9 @@ def fetch_with_cache(
 
     fresh: list[TrainingActivity] = []
     api_called = False
+    latest_refresh_token: str | None = None
     try:
-        client = _authed_client(client_id, client_secret, refresh_token)
+        client, latest_refresh_token = _authed_client(client_id, client_secret, refresh_token)
         fresh = list(
             _pull_runs_after(client, datetime.combine(sync_from, datetime.min.time(), tzinfo=UTC))
         )
@@ -129,6 +223,7 @@ def fetch_with_cache(
         cache_hits=cache_hits,
         latest_cached_date=store.latest_activity_date(),
         api_called=api_called,
+        refresh_token=latest_refresh_token,
     )
 
 
@@ -147,7 +242,7 @@ def _authed_client(client_id: str, client_secret: str, refresh_token: str):
         refresh_token=refresh_token,
     )
     client.access_token = token_response["access_token"]
-    return client
+    return client, token_response.get("refresh_token")
 
 
 def _pull_runs_after(client, after: datetime):

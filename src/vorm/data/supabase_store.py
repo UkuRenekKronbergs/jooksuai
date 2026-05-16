@@ -1,12 +1,12 @@
 """Supabase-backed store for per-user persistent state.
 
-Replaces the local SQLite ActivityStore for athlete profile and daily log when
-Supabase credentials are configured. Each method requires an authenticated
-`user_id`; Row-Level Security policies enforce per-user isolation at the
-database level (see `docs/supabase_schema.sql`).
+Replaces the local SQLite ActivityStore for athlete profile, daily log, and
+Strava OAuth connection metadata when Supabase credentials are configured.
+Each method requires an authenticated `user_id`; Row-Level Security policies
+enforce per-user isolation at the database level (see `docs/supabase_schema.sql`).
 
-The Strava activity delta-sync cache continues to use the local SQLite
-ActivityStore — that's a per-deployment HTTP cache, not user-facing state.
+The Strava activity delta-sync cache continues to use local SQLite files —
+that's an HTTP cache, not the authoritative user connection.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
-from .models import AthleteProfile
+from .models import AthleteProfile, StravaConnection
 from .storage import DailyLogEntry
 
 if TYPE_CHECKING:
@@ -28,7 +28,7 @@ class SupabaseNotConfigured(RuntimeError):
 
 @dataclass(frozen=False, eq=False)
 class SupabaseStore:
-    """Per-user façade over Supabase tables `athlete_profiles` + `daily_logs`.
+    """Per-user façade over Supabase tables for profile, logs, and Strava.
 
     Construct via `SupabaseStore(client=..., user_id=...)`. The `client` is
     expected to already have a session bound to `user_id` (so PostgREST
@@ -69,6 +69,41 @@ class SupabaseStore:
         if not rows:
             return None
         return _row_to_profile(rows[0])
+
+    # --- Strava OAuth connection -----------------------------------------
+
+    def save_strava_connection(self, connection: StravaConnection) -> None:
+        payload: dict[str, Any] = {
+            "user_id": self.user_id,
+            "client_id": connection.client_id,
+            "client_secret": connection.client_secret,
+            "refresh_token": connection.refresh_token,
+            "athlete_id": connection.athlete_id,
+            "athlete_name": connection.athlete_name,
+            "scope": connection.scope,
+        }
+        self.client.table("strava_connections").upsert(
+            payload, on_conflict="user_id"
+        ).execute()
+
+    def load_strava_connection(self) -> StravaConnection | None:
+        resp = (
+            self.client.table("strava_connections")
+            .select("*")
+            .eq("user_id", self.user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        return _row_to_strava_connection(rows[0]) if rows else None
+
+    def delete_strava_connection(self) -> None:
+        (
+            self.client.table("strava_connections")
+            .delete()
+            .eq("user_id", self.user_id)
+            .execute()
+        )
 
     # --- daily log --------------------------------------------------------
 
@@ -142,6 +177,17 @@ def _row_to_profile(row: dict[str, Any]) -> AthleteProfile:
         season_goal=row.get("season_goal") or "",
         personal_bests=row.get("personal_bests") or {},
         threshold_pace_min_per_km=row.get("threshold_pace_min_per_km"),
+    )
+
+
+def _row_to_strava_connection(row: dict[str, Any]) -> StravaConnection:
+    return StravaConnection(
+        client_id=row["client_id"],
+        client_secret=row["client_secret"],
+        refresh_token=row["refresh_token"],
+        athlete_id=row.get("athlete_id"),
+        athlete_name=row.get("athlete_name") or "",
+        scope=row.get("scope") or "",
     )
 
 
