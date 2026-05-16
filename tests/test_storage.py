@@ -124,6 +124,34 @@ def test_daily_log_list_filters_by_range(tmp_path):
     assert [e.log_date for e in in_range] == [date(2026, 5, 18)]
 
 
+def test_falls_back_to_tempdir_on_permission_error(tmp_path, monkeypatch):
+    """Streamlit Cloud / read-only FS regression: when the preferred parent
+    directory rejects mkdir, ActivityStore must still come up — using a
+    tempfile location — rather than crashing on first request."""
+    import pathlib
+
+    real_mkdir = pathlib.Path.mkdir
+    refused = tmp_path / "refused"
+
+    def fake_mkdir(self, *args, **kwargs):
+        try:
+            self.relative_to(refused)
+        except ValueError:
+            return real_mkdir(self, *args, **kwargs)
+        raise PermissionError(f"refused: {self}")
+
+    monkeypatch.setattr(pathlib.Path, "mkdir", fake_mkdir)
+
+    store = ActivityStore(refused / "cache" / "activities.sqlite")
+    assert str(store.db_path) != str(refused / "cache" / "activities.sqlite")
+    assert store.db_path.name == "activities.sqlite"
+    # Round-trip a profile through the fallback store to confirm it's wired up.
+    store.save_profile(AthleteProfile(
+        name="X", age=25, sex="M", max_hr=190, resting_hr=50, training_years=2,
+    ))
+    assert store.load_profile() is not None
+
+
 def test_daily_log_validates_scale_inputs(tmp_path):
     store = ActivityStore(tmp_path / "store.db")
     with pytest.raises(ValueError, match="usefulness"):

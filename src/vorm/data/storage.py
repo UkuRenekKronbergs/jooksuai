@@ -8,12 +8,33 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 from .models import AthleteProfile, TrainingActivity
+
+
+def _resolve_writable_db_path(preferred: Path) -> Path:
+    """Use the caller's preferred path when possible; fall back to a temp
+    directory if the filesystem rejects mkdir.
+
+    Streamlit Cloud and similar sandboxed hosts ship with read-only
+    site-packages paths. If `CACHE_DIR` (computed at import-time) happens to
+    resolve into one of those, the original `mkdir(parents=True)` raised
+    PermissionError and crashed the app on first request. Falling back to
+    `tempfile.gettempdir()` keeps the demo alive — at the cost of ephemeral
+    state, which is already the case on those hosts anyway.
+    """
+    try:
+        preferred.parent.mkdir(parents=True, exist_ok=True)
+        return preferred
+    except (PermissionError, OSError):
+        fallback_dir = Path(tempfile.gettempdir()) / "vorm-cache"
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        return fallback_dir / preferred.name
 
 
 @dataclass(frozen=True)
@@ -72,8 +93,7 @@ CREATE TABLE IF NOT EXISTS daily_log (
 
 class ActivityStore:
     def __init__(self, db_path: Path):
-        self.db_path = db_path
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path = _resolve_writable_db_path(db_path)
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
 
