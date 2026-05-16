@@ -11,6 +11,7 @@ UI layout:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import sys
 from datetime import date, timedelta
@@ -131,6 +132,77 @@ def _get_activities(
             st.error(f"Strava päring ebaõnnestus: {exc}")
             return []
     return []
+
+
+def _activity_context_key(
+    source: str,
+    use_demo_data: bool,
+    activities: list[TrainingActivity],
+) -> tuple[str, bool, int, str]:
+    """Stable enough key for hiding stale evaluations after data changes."""
+    digest = hashlib.sha256()
+    for activity in sorted(activities, key=lambda a: (a.activity_date, a.id)):
+        digest.update(
+            "|".join(
+                (
+                    activity.id,
+                    activity.activity_date.isoformat(),
+                    activity.activity_type,
+                    f"{activity.distance_km:.3f}",
+                    f"{activity.duration_min:.1f}",
+                    str(activity.avg_hr or ""),
+                    str(activity.max_hr_observed or ""),
+                    str(activity.avg_pace_min_per_km or ""),
+                    str(activity.elevation_gain_m or ""),
+                    str(activity.rpe or ""),
+                    activity.notes or "",
+                )
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return source, bool(use_demo_data), len(activities), digest.hexdigest()
+
+
+def _profile_context_key(profile: AthleteProfile) -> tuple:
+    return (
+        profile.name,
+        profile.age,
+        profile.sex,
+        profile.max_hr,
+        profile.resting_hr,
+        profile.training_years,
+        profile.season_goal,
+        tuple(sorted((profile.personal_bests or {}).items())),
+        profile.threshold_pace_min_per_km,
+    )
+
+
+def _subjective_context_key(subjective: DailySubjective) -> tuple:
+    return (
+        subjective.rpe_yesterday,
+        subjective.sleep_hours,
+        subjective.stress_level,
+        subjective.illness,
+        subjective.notes,
+    )
+
+
+def _evaluation_context_key(
+    *,
+    data_context_key: tuple[str, bool, int, str],
+    profile: AthleteProfile,
+    today_plan: str,
+    subjective: DailySubjective,
+    analysis_date: date,
+) -> tuple:
+    """Inputs that make an already-rendered recommendation stale when changed."""
+    return (
+        data_context_key,
+        analysis_date.isoformat(),
+        _profile_context_key(profile),
+        today_plan.strip(),
+        _subjective_context_key(subjective),
+    )
 
 
 def _render_profile_editor(default: AthleteProfile) -> AthleteProfile:
@@ -519,13 +591,10 @@ _autosave_profile(profile)
 # latest activity. Otherwise picking today() on a stale dataset shows
 # ACWR=0/TRIMP=0 because the 7-day window is empty.
 activities = _get_activities(source, uploaded_csv, days, cfg, use_demo_data=use_demo_data)
+has_activities = bool(activities)
+manual_without_history = source == _SOURCE_MANUAL and not has_activities
 latest_activity_date = max((a.activity_date for a in activities), default=None)
-data_context_key = (
-    source,
-    bool(use_demo_data),
-    len(activities),
-    latest_activity_date.isoformat() if latest_activity_date else None,
-)
+data_context_key = _activity_context_key(source, use_demo_data, activities)
 
 # Reset the widget's session_state when (a) it has never been set, or (b) the
 # stored choice is now past the loaded dataset — the latter handles the case
@@ -572,8 +641,8 @@ with st.container(border=True):
         "pöördu treeneri/arsti poole. Mudel ei diagnoosi ega ravi."
     )
 
-if not activities:
-    if source == _SOURCE_MANUAL:
+if not has_activities:
+    if manual_without_history:
         st.info(
             "Käsitsi lisamine alustab tühjalt. Lae vasakult CSV, ühenda andmeallikas "
             "või vajuta **Täida demoandmetega**, et näidist kohe proovida. "
@@ -591,6 +660,9 @@ if latest_activity_date and analysis_date > latest_activity_date:
         "ACWR ja akuutne TRIMP võivad näidata 0. Liiguta kuupäev tagasi viimasele trenni-päevale."
     )
 
+current_summary = summarize_load(activities, profile, as_of=analysis_date)
+daily_load = build_load_timeseries(activities, profile, end=analysis_date)
+
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     ["Tänane soovitus", "Koormuse ajalugu", "Tippajad",
      "Retrospektiivne test", "Treeningkava", "Päeva-logi"]
@@ -600,9 +672,9 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
 with tab1:
     st.subheader(f"Analüüsi seisuga {analysis_date.isoformat()}")
 
-    summary = summarize_load(activities, profile, as_of=analysis_date)
+    summary = current_summary
 
-    if not activities:
+    if not has_activities:
         st.info(
             "Treeningajalugu puudub, seega ACWR/TRIMP numbrid on tühjad. "
             "LLM kasutab sinu profiili, tänast plaani ja subjektiivseid sisendeid."
@@ -622,8 +694,11 @@ with tab1:
         help="Foster monotony = 7-päeva mean / std. ≥ 2.0 = vähe varieeruvust.",
     )
 
-    hr_coverage = sum(1 for a in activities if a.avg_hr) / max(len(activities), 1)
-    if activities and hr_coverage < 0.5:
+    if has_activities:
+        hr_coverage = sum(1 for a in activities if a.avg_hr) / len(activities)
+    else:
+        hr_coverage = 0.0
+    if has_activities and hr_coverage < 0.5:
         threshold = profile.effective_threshold_pace
         if threshold:
             st.info(
@@ -670,8 +745,7 @@ with tab1:
 
         # Statistiline turvafilter (PROJECT_PLAN §2): kui ACWR trend tõuseb,
         # näita projektsiooni ja "ületab ohu" hoiatust enne reegli fire-imist.
-        daily_for_forecast = build_load_timeseries(activities, profile, end=analysis_date)
-        acwr_ts = acwr_series(daily_for_forecast)["acwr"]
+        acwr_ts = acwr_series(daily_load)["acwr"]
         acwr_forecast = forecast_acwr(acwr_ts)
         forecast_msg = forecast_message(acwr_forecast)
         if forecast_msg:
@@ -679,6 +753,14 @@ with tab1:
                 st.warning(f"📈 {forecast_msg}")
             else:
                 st.info(f"📈 {forecast_msg}")
+
+    evaluation_context_key = _evaluation_context_key(
+        data_context_key=data_context_key,
+        profile=profile,
+        today_plan=today_plan,
+        subjective=subjective,
+        analysis_date=analysis_date,
+    )
 
     st.divider()
 
@@ -712,8 +794,7 @@ with tab1:
         # block (including the form's submit handler) to vanish before it
         # runs — daily logs silently never persist.
         st.session_state["last_evaluation"] = {
-            "analysis_date": analysis_date,
-            "data_context_key": data_context_key,
+            "evaluation_context_key": evaluation_context_key,
             "verdict": verdict,
             "llm_result": llm_result,
             "prompt_text": prompt_bundle.user,
@@ -722,8 +803,7 @@ with tab1:
     eval_state = st.session_state.get("last_evaluation")
     if (
         eval_state
-        and eval_state.get("analysis_date") == analysis_date
-        and eval_state.get("data_context_key") == data_context_key
+        and eval_state.get("evaluation_context_key") == evaluation_context_key
     ):
         _render_verdict_box(eval_state["verdict"], eval_state["llm_result"])
 
@@ -747,8 +827,8 @@ with tab1:
 
 # --- Tab 2: history
 with tab2:
-    daily = build_load_timeseries(activities, profile, end=analysis_date)
-    if not activities:
+    daily = daily_load
+    if not has_activities:
         st.info("Koormuse ajalugu ilmub siia siis, kui lisad CSV/andmeallika või käivitad demoandmed.")
     col1, col2 = st.columns(2)
     with col1:
@@ -822,62 +902,62 @@ with tab4:
         "(10 varasemat päeva) — võrdle oma tegeliku otsusega."
     )
 
-    if not activities:
+    if not has_activities:
         st.info("Retrospektiivne test vajab treeningajalugu. Tänase plaani jaoks kasuta esimest tabi.")
     else:
         earliest = min(a.activity_date for a in activities)
         latest = max(a.activity_date for a in activities)
-    if activities and latest <= earliest + timedelta(days=30):
-        st.warning("Liiga lühike andmeloend retrospektiivseks testiks (vaja ≥ 30 päeva).")
-    elif activities:
-        retro_date = st.date_input(
-            "Retrospektiivne kuupäev",
-            value=latest - timedelta(days=7),
-            min_value=earliest + timedelta(days=28),
-            max_value=latest,
-            key="retro_date",
-        )
-        retro_plan = st.text_input(
-            "Mida sa sel päeval tegid (või pidid tegema)?",
-            placeholder="Nt: 5x1000m @ 3:25",
-            key="retro_plan",
-        )
-        retro_rpe = st.slider("Eilse treeningu RPE", 1, 10, 5, key="retro_rpe")
-
-        if st.button("Käivita retrospektiivne hindamine"):
-            past_activities = [a for a in activities if a.activity_date <= retro_date]
-            retro_summary = summarize_load(past_activities, profile, as_of=retro_date)
-            retro_subjective = DailySubjective(
-                entry_date=retro_date,
-                rpe_yesterday=retro_rpe,
+        if latest <= earliest + timedelta(days=30):
+            st.warning("Liiga lühike andmeloend retrospektiivseks testiks (vaja ≥ 30 päeva).")
+        else:
+            retro_date = st.date_input(
+                "Retrospektiivne kuupäev",
+                value=latest - timedelta(days=7),
+                min_value=earliest + timedelta(days=28),
+                max_value=latest,
+                key="retro_date",
             )
-            retro_verdict = evaluate_safety_rules(retro_summary, retro_subjective)
+            retro_plan = st.text_input(
+                "Mida sa sel päeval tegid (või pidid tegema)?",
+                placeholder="Nt: 5x1000m @ 3:25",
+                key="retro_plan",
+            )
+            retro_rpe = st.slider("Eilse treeningu RPE", 1, 10, 5, key="retro_rpe")
 
-            st.markdown(f"#### Seis {retro_date.isoformat()} kohta")
-            col_a, col_b, col_c = st.columns(3)
-            col_a.metric("ACWR", f"{retro_summary.acwr:.2f}" if retro_summary.acwr else "—")
-            col_b.metric("7 p TRIMP", f"{retro_summary.acute_7d:.0f}")
-            col_c.metric("28 p TRIMP", f"{retro_summary.chronic_28d:.0f}")
-
-            retro_llm = None
-            if cfg.has_llm and retro_plan.strip():
-                retro_prompt = build_prompt(
-                    profile=profile,
-                    activities=past_activities,
-                    summary=retro_summary,
-                    verdict=retro_verdict,
-                    today_plan=retro_plan,
-                    subjective=retro_subjective,
-                    today=retro_date,
+            if st.button("Käivita retrospektiivne hindamine"):
+                past_activities = [a for a in activities if a.activity_date <= retro_date]
+                retro_summary = summarize_load(past_activities, profile, as_of=retro_date)
+                retro_subjective = DailySubjective(
+                    entry_date=retro_date,
+                    rpe_yesterday=retro_rpe,
                 )
-                with st.spinner("LLM retrospektiivne hinnang..."):
-                    try:
-                        retro_llm = generate_recommendation(retro_prompt, cfg)
-                    except Exception as exc:
-                        st.error(f"LLM viga: {exc}")
+                retro_verdict = evaluate_safety_rules(retro_summary, retro_subjective)
 
-            _render_safety_flags(retro_verdict)
-            _render_verdict_box(retro_verdict, retro_llm)
+                st.markdown(f"#### Seis {retro_date.isoformat()} kohta")
+                col_a, col_b, col_c = st.columns(3)
+                col_a.metric("ACWR", f"{retro_summary.acwr:.2f}" if retro_summary.acwr else "—")
+                col_b.metric("7 p TRIMP", f"{retro_summary.acute_7d:.0f}")
+                col_c.metric("28 p TRIMP", f"{retro_summary.chronic_28d:.0f}")
+
+                retro_llm = None
+                if cfg.has_llm and retro_plan.strip():
+                    retro_prompt = build_prompt(
+                        profile=profile,
+                        activities=past_activities,
+                        summary=retro_summary,
+                        verdict=retro_verdict,
+                        today_plan=retro_plan,
+                        subjective=retro_subjective,
+                        today=retro_date,
+                    )
+                    with st.spinner("LLM retrospektiivne hinnang..."):
+                        try:
+                            retro_llm = generate_recommendation(retro_prompt, cfg)
+                        except Exception as exc:
+                            st.error(f"LLM viga: {exc}")
+
+                _render_safety_flags(retro_verdict)
+                _render_verdict_box(retro_verdict, retro_llm)
 
 # --- Tab 5: training plan generator
 with tab5:
@@ -932,7 +1012,7 @@ with tab5:
                 target_time_minutes=float(target_min),
                 event_date=event_date,
             )
-            summary_for_plan = summarize_load(activities, profile, as_of=analysis_date) if activities else None
+            summary_for_plan = current_summary if has_activities else None
 
             with st.spinner(f"Genereerin {weeks_between}-nädalast kava ({cfg.llm_model})..."):
                 try:
