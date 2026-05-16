@@ -1,3 +1,12 @@
+"""Tests for vorm.auth — URL-query-param session persistence.
+
+The cookie/JS-bridge implementation was retired because it didn't survive a
+tab refresh on Streamlit Cloud. The new mechanism uses a server-side registry
+keyed by an opaque token attached as ``?s=<token>``; ``st.query_params``
+reads/writes that token synchronously, so refresh works without any iframe
+sandbox dance.
+"""
+
 from __future__ import annotations
 
 import time
@@ -6,81 +15,131 @@ from types import SimpleNamespace
 
 from vorm import auth
 
+_VALID_TOKEN = "abcdefghijklmnopqrstuvwxyz1234"  # 30 chars, alnum — valid id
+
 
 def _registry():
     return {"lock": RLock(), "sessions": {}}
 
 
-def test_browser_session_key_uses_vorm_cookie(monkeypatch):
-    cookie_value = "vorm-session-cookie-abcdefghijklmnopqrstuvwxyz"
-    monkeypatch.setattr(auth, "_read_browser_session_cookie", lambda: cookie_value)
-    monkeypatch.setattr(auth.st, "session_state", {})
+# --- URL session-token plumbing ----------------------------------------
 
-    assert auth._browser_session_key() == cookie_value
-    assert auth.st.session_state[auth._COOKIE_SESSION_KEY] == cookie_value
+def test_read_session_token_rejects_short_or_dirty_tokens(monkeypatch):
+    """`?s=` values shorter than 24 chars or with disallowed chars are ignored.
 
+    A stray short token shouldn't crash auth, just degrade to no-session.
+    """
+    monkeypatch.setattr(auth.st, "query_params", {"s": "too-short"})
+    assert auth._read_session_token() is None
 
-def test_read_browser_session_cookie_uses_controller_fallback(monkeypatch):
-    cookie_value = "controller-session-abcdefghijklmnopqrstuvwxyz"
-
-    class FakeCookies:
-        def to_dict(self):
-            return {}
-
-    class FakeController:
-        def get(self, name):
-            assert name == auth._COOKIE_NAME
-            return cookie_value
-
-    monkeypatch.setattr(auth.st, "context", SimpleNamespace(cookies=FakeCookies()))
-    monkeypatch.setattr(auth, "_cookie_controller", lambda: FakeController())
-
-    assert auth._read_browser_session_cookie() == cookie_value
+    monkeypatch.setattr(auth.st, "query_params", {"s": "bad chars in url!!!"})
+    assert auth._read_session_token() is None
 
 
-def test_sync_browser_session_cookie_creates_opaque_cookie(monkeypatch):
-    rendered = []
-    generated = "generated-session-abcdefghijklmnopqrstuvwxyz"
-    monkeypatch.setattr(auth, "_read_browser_session_cookie", lambda: None)
-    monkeypatch.setattr(auth.secrets, "token_urlsafe", lambda length: generated)
-    monkeypatch.setattr(
-        auth,
-        "_set_browser_session_cookie",
-        lambda session_id: rendered.append(session_id),
-    )
-    monkeypatch.setattr(auth.st, "session_state", {})
-
-    auth._sync_browser_session_cookie()
-
-    assert auth.st.session_state[auth._COOKIE_SESSION_KEY] == generated
-    assert rendered == [generated]
+def test_read_session_token_returns_valid_token(monkeypatch):
+    monkeypatch.setattr(auth.st, "query_params", {"s": _VALID_TOKEN})
+    assert auth._read_session_token() == _VALID_TOKEN
 
 
-def test_forget_persistent_session_schedules_cookie_delete(monkeypatch):
+def test_write_session_token_skips_when_unchanged(monkeypatch):
+    """Writing the same token shouldn't mutate query_params (avoids rerun spam)."""
+
+    class CountingDict(dict):
+        writes = 0
+
+        def __setitem__(self, key, value):
+            CountingDict.writes += 1
+            super().__setitem__(key, value)
+
+    qp = CountingDict({"s": _VALID_TOKEN})
+    monkeypatch.setattr(auth.st, "query_params", qp)
+
+    auth._write_session_token(_VALID_TOKEN)
+    assert CountingDict.writes == 0
+
+
+def test_clear_session_token_only_drops_session_key(monkeypatch):
+    qp = {"s": _VALID_TOKEN, "other": "x"}
+    monkeypatch.setattr(auth.st, "query_params", qp)
+    auth._clear_session_token()
+    assert qp == {"other": "x"}
+
+
+# --- Server-side registry ----------------------------------------------
+
+def test_remember_mints_token_and_registers_session(monkeypatch):
     registry = _registry()
-    registry["sessions"]["browser-1"] = auth._PersistedSession(
-        kind="guest",
-        user=None,
-        updated_at=time.time(),
-    )
-    monkeypatch.setattr(auth, "_browser_session_key", lambda: "browser-1")
+    qp: dict = {}
+    monkeypatch.setattr(auth.st, "query_params", qp)
     monkeypatch.setattr(auth, "_persistent_sessions", lambda: registry)
-    monkeypatch.setattr(auth.st, "session_state", {})
+    monkeypatch.setattr(auth.secrets, "token_urlsafe", lambda _n: _VALID_TOKEN)
+
+    auth._remember_persistent_session("guest")
+
+    assert qp["s"] == _VALID_TOKEN
+    persisted = registry["sessions"][_VALID_TOKEN]
+    assert persisted.kind == "guest"
+    assert persisted.user is None
+
+
+def test_remember_reuses_existing_url_token(monkeypatch):
+    """When the URL already carries a token, don't mint a new one — keeps
+    navigation stable for a logged-in user opening multiple tabs."""
+    registry = _registry()
+    qp = {"s": _VALID_TOKEN}
+    monkeypatch.setattr(auth.st, "query_params", qp)
+    monkeypatch.setattr(auth, "_persistent_sessions", lambda: registry)
+    monkeypatch.setattr(
+        auth.secrets, "token_urlsafe", lambda _n: "should-not-be-used",
+    )
+
+    auth._remember_persistent_session("guest")
+
+    assert qp["s"] == _VALID_TOKEN
+    assert _VALID_TOKEN in registry["sessions"]
+
+
+def test_forget_removes_from_registry_and_url(monkeypatch):
+    registry = _registry()
+    registry["sessions"][_VALID_TOKEN] = auth._PersistedSession(
+        kind="user", user=None, updated_at=time.time(),
+    )
+    qp = {"s": _VALID_TOKEN}
+    monkeypatch.setattr(auth.st, "query_params", qp)
+    monkeypatch.setattr(auth, "_persistent_sessions", lambda: registry)
 
     auth._forget_persistent_session()
 
     assert registry["sessions"] == {}
-    assert auth.st.session_state[auth._COOKIE_DELETE_PENDING_KEY] is True
+    assert "s" not in qp
 
+
+def test_load_persistent_session_bumps_ttl(monkeypatch):
+    """Loading a session should refresh its updated_at so an actively-used
+    session doesn't get pruned."""
+    registry = _registry()
+    stale_time = time.time() - 60 * 60  # 1 hour ago
+    registry["sessions"][_VALID_TOKEN] = auth._PersistedSession(
+        kind="user", user=None, updated_at=stale_time,
+    )
+    monkeypatch.setattr(auth.st, "query_params", {"s": _VALID_TOKEN})
+    monkeypatch.setattr(auth, "_persistent_sessions", lambda: registry)
+
+    auth._load_persistent_session()
+
+    assert registry["sessions"][_VALID_TOKEN].updated_at > stale_time
+
+
+# --- High-level restore flow ------------------------------------------
 
 def test_restore_persistent_guest(monkeypatch):
     registry = _registry()
-    monkeypatch.setattr(auth, "_browser_session_key", lambda: "browser-1")
-    monkeypatch.setattr(auth, "_render_cookie_script", lambda *args, **kwargs: None)
-    monkeypatch.setattr(auth, "_persistent_sessions", lambda: registry)
+    registry["sessions"][_VALID_TOKEN] = auth._PersistedSession(
+        kind="guest", user=None, updated_at=time.time(),
+    )
+    monkeypatch.setattr(auth.st, "query_params", {"s": _VALID_TOKEN})
     monkeypatch.setattr(auth.st, "session_state", {})
-
-    auth._remember_persistent_session("guest")
+    monkeypatch.setattr(auth, "_persistent_sessions", lambda: registry)
 
     assert auth._restore_persistent_session() is None
     assert auth.is_guest()
@@ -94,10 +153,8 @@ def test_restore_persistent_user_refreshes_supabase_session(monkeypatch):
         access_token="old-access",
         refresh_token="old-refresh",
     )
-    registry["sessions"]["browser-1"] = auth._PersistedSession(
-        kind="user",
-        user=old_user,
-        updated_at=time.time(),
+    registry["sessions"][_VALID_TOKEN] = auth._PersistedSession(
+        kind="user", user=old_user, updated_at=time.time(),
     )
 
     class FakeAuth:
@@ -112,23 +169,25 @@ def test_restore_persistent_user_refreshes_supabase_session(monkeypatch):
             )
 
     fake_client = SimpleNamespace(auth=FakeAuth())
-    monkeypatch.setattr(auth, "_browser_session_key", lambda: "browser-1")
-    monkeypatch.setattr(auth, "_render_cookie_script", lambda *args, **kwargs: None)
+    monkeypatch.setattr(auth.st, "query_params", {"s": _VALID_TOKEN})
+    monkeypatch.setattr(auth.st, "session_state", {})
     monkeypatch.setattr(auth, "_persistent_sessions", lambda: registry)
     monkeypatch.setattr(auth, "_get_client", lambda: fake_client)
-    monkeypatch.setattr(auth.st, "session_state", {})
 
     restored = auth._restore_persistent_session()
 
-    assert restored == auth.AuthUser(
+    expected = auth.AuthUser(
         id="user-1",
         email="runner@example.com",
         access_token="new-access",
         refresh_token="new-refresh",
     )
-    assert auth.current_user() == restored
-    assert registry["sessions"]["browser-1"].user == restored
+    assert restored == expected
+    assert auth.current_user() == expected
+    assert registry["sessions"][_VALID_TOKEN].user == expected
 
+
+# --- Password reset flow (backend unchanged by the URL-token rewrite) ---
 
 def test_request_password_reset_uses_current_app_redirect(monkeypatch):
     calls = []
@@ -185,7 +244,9 @@ def test_consume_password_recovery_code_sets_recovery_mode(monkeypatch):
         "_remember_persistent_session",
         lambda kind, user=None: remembered.append((kind, user)),
     )
-    monkeypatch.setattr(auth, "_forget_persistent_session", lambda: forgotten.append(True))
+    monkeypatch.setattr(
+        auth, "_forget_persistent_session", lambda: forgotten.append(True),
+    )
     monkeypatch.setattr(auth.st, "query_params", query_params)
     monkeypatch.setattr(auth.st, "session_state", {})
 
