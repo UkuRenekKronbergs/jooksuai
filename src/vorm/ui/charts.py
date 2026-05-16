@@ -97,10 +97,17 @@ def daily_load_chart(daily_load: pd.Series) -> go.Figure:
         title="Igapäevane treeningkoormus",
         xaxis_title="Kuupäev",
         yaxis_title="TRIMP",
-        height=360,
-        margin=dict(l=40, r=20, t=60, b=40),
+        height=400,
+        # Bottom margin holds the legend; top stays compact so the title sits
+        # alone above the plot (previously the horizontal legend was anchored
+        # at y=1.02 next to the title and overlapped it in narrow columns).
+        margin=dict(l=40, r=20, t=60, b=90),
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        legend=dict(
+            orientation="h",
+            yanchor="top", y=-0.22,
+            xanchor="center", x=0.5,
+        ),
     )
     return fig
 

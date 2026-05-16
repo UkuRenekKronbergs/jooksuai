@@ -232,12 +232,13 @@ def _get_user_store():
     """Resolve the user-scoped store for profile + daily logs.
 
     Returns SupabaseStore when the user is signed in (per-user, RLS-protected),
-    else the local SQLite ActivityStore (anonymous demo mode). Both expose
-    ``save_profile``/``load_profile`` and ``save_daily_log``/``get_daily_log``/
-    ``list_daily_logs`` so call sites don't branch on backend.
+    else the local SQLite ActivityStore. The local path covers three cases:
+    Supabase not configured, user picked 'guest' on the login gate, or the
+    Supabase client transiently failed. All three should keep working without
+    cloud persistence.
     """
     cfg_now = load_config()
-    if cfg_now.has_supabase:
+    if cfg_now.has_supabase and not auth.is_guest():
         store = auth.get_store()
         if store is not None:
             return store
@@ -423,19 +424,19 @@ def _summary_table(activities: list[TrainingActivity], today: date) -> pd.DataFr
 # --- Sidebar --------------------------------------------------------------
 cfg = load_config()
 
-# Auth gate: when Supabase is configured, require login before any UI renders.
-# Without Supabase the app runs in anonymous mode against local SQLite — useful
-# for local dev and offline demos.
+# Auth gate: when Supabase is configured, require login OR guest opt-in
+# before any UI renders. Without Supabase the app runs in anonymous mode
+# against local SQLite — useful for local dev and offline demos.
 auth_user = None
 if cfg.has_supabase:
     auth_user = auth.render_login_gate()
-    if auth_user is None:
+    if auth_user is None and not auth.is_guest():
         st.stop()
 
 st.sidebar.title("🏃 Vorm.ai")
 st.sidebar.caption("AI-põhine treeningkoormuse analüüsija")
 
-if auth_user:
+if auth_user or auth.is_guest():
     auth.render_sidebar_user_panel()
     st.sidebar.divider()
 

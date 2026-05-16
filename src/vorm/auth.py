@@ -41,6 +41,7 @@ class AuthUser:
 _CLIENT_KEY = "_vorm_supabase_client"
 _USER_KEY = "_vorm_auth_user"
 _PENDING_CONFIRM_KEY = "_vorm_auth_pending_confirm_email"
+_GUEST_KEY = "_vorm_guest_mode"
 
 
 def _build_client() -> Client:
@@ -79,6 +80,25 @@ def current_user() -> AuthUser | None:
 
 def is_authenticated() -> bool:
     return current_user() is not None
+
+
+def is_guest() -> bool:
+    """True when the user picked 'continue as guest' on the login gate.
+
+    Guests bypass the login but their data goes to local SQLite — same code
+    path as anonymous mode (no Supabase configured at all). Nothing they
+    enter touches the cloud, so reruns within the session persist but
+    deploys / hard-refreshes lose state.
+    """
+    return bool(st.session_state.get(_GUEST_KEY))
+
+
+def enter_guest_mode() -> None:
+    st.session_state[_GUEST_KEY] = True
+
+
+def exit_guest_mode() -> None:
+    st.session_state.pop(_GUEST_KEY, None)
 
 
 def _bind_session(client: Client, user: AuthUser) -> None:
@@ -181,12 +201,16 @@ def _humanize_auth_error(exc: Exception) -> str:
 def render_login_gate() -> AuthUser | None:
     """Block the app behind an email/password login form. Returns the user or None.
 
-    Call near the top of ``app.py`` and ``st.stop()`` if the return is None —
-    nothing else should render until the user signs in.
+    Call near the top of ``app.py``. If the return is None **and**
+    ``is_guest()`` is False, the caller should ``st.stop()`` — nothing else
+    should render until the user either signs in or picks guest mode.
     """
     user = current_user()
     if user:
         return user
+    # Guests have already bypassed the gate; don't re-render the form.
+    if is_guest():
+        return None
 
     st.title("🏃 Vorm.ai")
     st.markdown("### 🔐 Logi sisse, et jätkata")
@@ -273,16 +297,43 @@ def render_login_gate() -> AuthUser | None:
                 st.session_state[_PENDING_CONFIRM_KEY] = cleaned_email
                 st.rerun()
 
+    # Guest-mode escape hatch — useful for course-project demos and reviewers
+    # who don't want to create an account just to poke at the UI.
+    st.divider()
+    st.caption(
+        "Soovid lihtsalt rakendust katsetada ilma kontot loomata? "
+        "Külalisrežiimis sinu andmed **ei salvestu pilve** — kõik on "
+        "ainult selle brauserisessiooni jaoks."
+    )
+    if st.button(
+        "👤 Jätka külalisena",
+        key="_vorm_enter_guest",
+        use_container_width=True,
+    ):
+        enter_guest_mode()
+        st.rerun()
+
     return None
 
 
 def render_sidebar_user_panel() -> None:
-    """Show the signed-in user + sign-out button. No-op if not authenticated."""
+    """Show the signed-in user or guest banner + sign-out button in the sidebar."""
     user = current_user()
-    if not user:
+    if user:
+        with st.sidebar:
+            st.markdown(f"👤 **{user.email}**")
+            if st.button("Logi välja", key="_vorm_sign_out", use_container_width=True):
+                sign_out()
+                st.rerun()
         return
-    with st.sidebar:
-        st.markdown(f"👤 **{user.email}**")
-        if st.button("Logi välja", key="_vorm_sign_out", use_container_width=True):
-            sign_out()
-            st.rerun()
+    if is_guest():
+        with st.sidebar:
+            st.markdown("👤 **Külaline**")
+            st.caption("Andmed ei salvestu pilve.")
+            if st.button(
+                "Logi sisse / loo konto",
+                key="_vorm_exit_guest",
+                use_container_width=True,
+            ):
+                exit_guest_mode()
+                st.rerun()
