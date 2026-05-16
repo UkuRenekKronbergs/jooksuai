@@ -186,13 +186,19 @@ Rakendus on cloud-deploy-valmis. Failisüsteemil ei pea olema kirjeldatud sõltu
 1. **Logi sisse** [share.streamlit.io](https://share.streamlit.io) GitHubi kaudu.
 2. **Deploy app** → repo: `UkuRenekKronbergs/vorm`, branch: `main`, main file: `app.py`.
 3. **Advanced settings → Python version:** vali `3.13` (matches [`runtime.txt`](runtime.txt)).
-4. **App settings → Secrets** — kleebi TOML-vormingus (näide OpenRouteri + DeepSeek-iga):
+4. **App settings → Secrets** — kleebi TOML-vormingus (näide OpenRouteri tasuta GPT-OSS 120B-ga):
    ```toml
    LLM_PROVIDER = "openrouter"
-   LLM_MODEL = "deepseek/deepseek-v4-flash"
+   LLM_MODEL = "openai/gpt-oss-120b:free"
    LLM_TEMPERATURE = "0"
    OPENROUTER_API_KEY = "sk-or-v1-..."
-   # Anthropic / OpenAI variandid:
+   # Tasuta alternatiivid (kontrollitud 2026-05 seisuga, kvaliteedi järgi):
+   # LLM_MODEL = "nousresearch/hermes-3-llama-3.1-405b:free"   # suurim avatud mudel
+   # LLM_MODEL = "meta-llama/llama-3.3-70b-instruct:free"     # kiire, mõnikord rate-limited
+   # LLM_MODEL = "deepseek/deepseek-v4-flash:free"             # 1M context, tugev arutlus
+   # Tasuline alternatiiv (kõrgeim kvaliteet, ~$0.01-0.05 päringu kohta):
+   # LLM_MODEL = "anthropic/claude-sonnet-4.6"
+   # Otse-provideri võtmed (kui ei kasuta OpenRouter'it):
    # ANTHROPIC_API_KEY = "sk-ant-..."
    # OPENAI_API_KEY    = "sk-..."
    # Strava (valikuline — ilma selleta peita "Strava API" valik UI-st):
