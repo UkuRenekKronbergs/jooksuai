@@ -3,10 +3,11 @@
 -- Käivita see üks kord:
 --   Supabase Dashboard → SQL Editor → New query → kleebi sisu → Run.
 --
--- Loob kolm kasutaja-skoobiga tabelit:
+-- Loob neli kasutaja-skoobiga tabelit:
 --   - athlete_profiles  — sportlase profiil (üks rida per kasutaja)
 --   - daily_logs        — päeva-logi (Project Plan §4.3, üks rida per kasutaja+kuupäev)
 --   - strava_connections — kasutaja Strava OAuth seos (üks rida per kasutaja)
+--   - coach_decisions   — treeneri pimemenetluses tehtud päevaotsused (§4.2)
 --
 -- Mõlemal on Row-Level Security sees: iga kasutaja näeb / muudab AINULT
 -- enda ridu, isegi kui keegi peaks anon-võtmega päringuid manipuleerima.
@@ -136,4 +137,42 @@ CREATE POLICY "Users update own logs" ON public.daily_logs
     FOR UPDATE USING (auth.uid() = user_id)
                 WITH CHECK (auth.uid() = user_id);
 CREATE POLICY "Users delete own logs" ON public.daily_logs
+    FOR DELETE USING (auth.uid() = user_id);
+
+
+-- ===== coach_decisions ================================================
+-- §4.2 valideerimisetapp: treener sisestab oma päevaotsuse Vorm.ai-st
+-- nägemata. Üks rida per (kasutaja, kuupäev) — kui sama päeva peale
+-- saadetakse uus otsus, varasem kirjutatakse üle.
+CREATE TABLE IF NOT EXISTS public.coach_decisions (
+    user_id              UUID        NOT NULL
+                                     REFERENCES auth.users(id)
+                                     ON DELETE CASCADE,
+    decision_date        DATE        NOT NULL,
+    coach_name           TEXT        NOT NULL DEFAULT 'Ille Kukk',
+    recommended_category TEXT        NOT NULL,
+    rationale            TEXT,
+    notes                TEXT,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, decision_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_coach_decisions_user_date
+    ON public.coach_decisions (user_id, decision_date DESC);
+
+ALTER TABLE public.coach_decisions ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users select own coach decisions" ON public.coach_decisions;
+DROP POLICY IF EXISTS "Users insert own coach decisions" ON public.coach_decisions;
+DROP POLICY IF EXISTS "Users update own coach decisions" ON public.coach_decisions;
+DROP POLICY IF EXISTS "Users delete own coach decisions" ON public.coach_decisions;
+
+CREATE POLICY "Users select own coach decisions" ON public.coach_decisions
+    FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users insert own coach decisions" ON public.coach_decisions
+    FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users update own coach decisions" ON public.coach_decisions
+    FOR UPDATE USING (auth.uid() = user_id)
+                WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users delete own coach decisions" ON public.coach_decisions
     FOR DELETE USING (auth.uid() = user_id);

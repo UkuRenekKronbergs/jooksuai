@@ -23,6 +23,26 @@ from ..metrics.personal_bests import progression_at_distance
 _COLOR_SWEETSPOT = "rgba(76, 175, 80, 0.15)"
 _COLOR_DANGER = "rgba(244, 67, 54, 0.12)"
 
+# Karvonen HR-reserve thresholds → zones 1..5. Pace fallback uses ratios of
+# threshold pace, with slower paces in lower zones (training-pace convention,
+# i.e. easy = slower = Z1, V̇O₂max = faster = Z5).
+_ZONE_HR_THRESHOLDS = (0.60, 0.70, 0.80, 0.90)  # < first → Z1, etc.
+_ZONE_PACE_THRESHOLDS = (1.20, 1.10, 1.00, 0.95)  # ≥ first → Z1; descending
+_ZONE_COLORS = {
+    1: "#3A86FF",  # blue — recovery
+    2: "#06A77D",  # green — endurance / aerobic base
+    3: "#FFB400",  # yellow — tempo
+    4: "#FB8500",  # orange — lactate threshold
+    5: "#E55934",  # red — V̇O₂max
+}
+_ZONE_LABELS = {
+    1: "Z1 Taastumine",
+    2: "Z2 Vastupidavus",
+    3: "Z3 Tempo",
+    4: "Z4 Lävi",
+    5: "Z5 V̇O₂max",
+}
+
 
 def acwr_chart(daily_load: pd.Series) -> go.Figure:
     df = acwr_series(daily_load)
@@ -320,5 +340,103 @@ def rpe_trend_chart(
         height=260,
         margin=dict(l=40, r=20, t=60, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def _classify_zone_by_hr(avg_hr: int, profile: AthleteProfile) -> int:
+    """Karvonen HR-reserve bucket. ``avg_hr`` is whole-activity average — one
+    zone per activity (we don't have second-by-second HR streams)."""
+    span = profile.max_hr - profile.resting_hr
+    if span <= 0:
+        return 2
+    pct = max(0.0, min(1.0, (avg_hr - profile.resting_hr) / span))
+    for zone_id, threshold in enumerate(_ZONE_HR_THRESHOLDS, start=1):
+        if pct < threshold:
+            return zone_id
+    return 5
+
+
+def _classify_zone_by_pace(pace: float, threshold_pace: float) -> int:
+    """Pace-ratio bucket (HR-less fallback). Slower pace = higher ratio = lower
+    zone, matching runner convention (easy = Z1, V̇O₂max = Z5)."""
+    if not pace or not threshold_pace or threshold_pace <= 0:
+        return 2
+    ratio = pace / threshold_pace
+    for zone_id, threshold in enumerate(_ZONE_PACE_THRESHOLDS, start=1):
+        if ratio >= threshold:
+            return zone_id
+    return 5
+
+
+def hr_zone_distribution_chart(
+    activities: list[TrainingActivity], profile: AthleteProfile,
+) -> go.Figure:
+    """Weekly stacked bars of training time per HR zone (Z1–Z5).
+
+    Each activity is bucketed into one zone by ``avg_hr`` when present, else by
+    ``avg_pace_min_per_km`` against the athlete's threshold pace. Activities
+    with neither HR nor pace are silently dropped — they don't contribute to
+    the polarization view. The 80/20 polarized-training rule (Seiler) is the
+    target reading: ~80% of weekly time in Z1–Z2, ~20% in Z4–Z5.
+    """
+    fig = go.Figure()
+    threshold_pace = profile.effective_threshold_pace
+    rows: list[dict] = []
+    for a in activities:
+        if not a.is_run():
+            continue
+        if a.avg_hr and profile.max_hr > profile.resting_hr:
+            zone = _classify_zone_by_hr(a.avg_hr, profile)
+        elif a.avg_pace_min_per_km and threshold_pace:
+            zone = _classify_zone_by_pace(a.avg_pace_min_per_km, threshold_pace)
+        else:
+            continue
+        week_start = pd.Timestamp(a.activity_date).to_period("W-MON").start_time.date()
+        rows.append({"week": week_start, "zone": zone, "duration": a.duration_min})
+
+    if not rows:
+        fig.update_layout(
+            title="HR-tsoonide jaotus — HR ega tempo-andmeid pole",
+            height=400,
+            margin=dict(l=40, r=20, t=60, b=90),
+        )
+        return fig
+
+    df = pd.DataFrame(rows)
+    agg = (
+        df.groupby(["week", "zone"])["duration"]
+        .sum()
+        .unstack(fill_value=0)
+        .sort_index()
+    )
+    for zone_id in (1, 2, 3, 4, 5):
+        if zone_id not in agg.columns:
+            continue
+        fig.add_trace(
+            go.Bar(
+                x=agg.index,
+                y=agg[zone_id].values,
+                name=_ZONE_LABELS[zone_id],
+                marker_color=_ZONE_COLORS[zone_id],
+                hovertemplate=(
+                    f"{_ZONE_LABELS[zone_id]}: %{{y:.0f}} min<br>"
+                    "Nädal: %{x|%Y-%m-%d}<extra></extra>"
+                ),
+            )
+        )
+    fig.update_layout(
+        title="HR-tsoonide nädalane jaotus",
+        xaxis_title="Nädala algus",
+        yaxis_title="Aeg (min)",
+        barmode="stack",
+        height=400,
+        margin=dict(l=40, r=20, t=60, b=90),
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="top", y=-0.22,
+            xanchor="center", x=0.5,
+        ),
     )
     return fig

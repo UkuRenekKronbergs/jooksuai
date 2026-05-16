@@ -16,7 +16,7 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
 from .models import AthleteProfile, StravaConnection
-from .storage import DailyLogEntry
+from .storage import CoachDecision, DailyLogEntry
 
 if TYPE_CHECKING:
     from supabase import Client
@@ -165,6 +165,57 @@ class SupabaseStore:
         resp = q.order("log_date", desc=False).execute()
         return [_row_to_daily_log(r) for r in (resp.data or [])]
 
+    # --- Coach decisions (Project Plan §4.2) -----------------------------
+
+    def save_coach_decision(self, decision: CoachDecision) -> None:
+        payload: dict[str, Any] = {
+            "user_id": self.user_id,
+            "decision_date": decision.decision_date.isoformat(),
+            "coach_name": decision.coach_name,
+            "recommended_category": decision.recommended_category,
+            "rationale": decision.rationale,
+            "notes": decision.notes,
+        }
+        self.client.table("coach_decisions").upsert(
+            payload, on_conflict="user_id,decision_date"
+        ).execute()
+
+    def get_coach_decision(self, day: date) -> CoachDecision | None:
+        resp = (
+            self.client.table("coach_decisions")
+            .select("*")
+            .eq("user_id", self.user_id)
+            .eq("decision_date", day.isoformat())
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        return _row_to_coach_decision(rows[0]) if rows else None
+
+    def list_coach_decisions(
+        self, since: date | None = None, until: date | None = None,
+    ) -> list[CoachDecision]:
+        q = (
+            self.client.table("coach_decisions")
+            .select("*")
+            .eq("user_id", self.user_id)
+        )
+        if since:
+            q = q.gte("decision_date", since.isoformat())
+        if until:
+            q = q.lte("decision_date", until.isoformat())
+        resp = q.order("decision_date", desc=False).execute()
+        return [_row_to_coach_decision(r) for r in (resp.data or [])]
+
+    def delete_coach_decision(self, day: date) -> None:
+        (
+            self.client.table("coach_decisions")
+            .delete()
+            .eq("user_id", self.user_id)
+            .eq("decision_date", day.isoformat())
+            .execute()
+        )
+
 
 def _row_to_profile(row: dict[str, Any]) -> AthleteProfile:
     return AthleteProfile(
@@ -209,6 +260,24 @@ def _row_to_daily_log(row: dict[str, Any]) -> DailyLogEntry:
         persuasiveness=row.get("persuasiveness"),
         followed=row.get("followed"),
         next_session_feeling=row.get("next_session_feeling"),
+        notes=row.get("notes"),
+        created_at=created_at,
+    )
+
+
+def _row_to_coach_decision(row: dict[str, Any]) -> CoachDecision:
+    created_at: datetime | None = None
+    raw_created = row.get("created_at")
+    if isinstance(raw_created, str):
+        try:
+            created_at = datetime.fromisoformat(raw_created.replace("Z", "+00:00"))
+        except ValueError:
+            created_at = None
+    return CoachDecision(
+        decision_date=date.fromisoformat(row["decision_date"]),
+        recommended_category=row["recommended_category"],
+        coach_name=row.get("coach_name") or "Ille Kukk",
+        rationale=row.get("rationale"),
         notes=row.get("notes"),
         created_at=created_at,
     )

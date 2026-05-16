@@ -12,6 +12,7 @@ requests>=2.31
 pydantic>=2.6
 tabulate>=0.9
 supabase>=2.0
+reportlab>=4.0
 
 # Install the local `vorm` package itself (src-layout, declared in pyproject.toml).
 # Streamlit Cloud only runs `pip install -r requirements.txt`, so without this

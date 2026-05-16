@@ -37,7 +37,7 @@ from vorm.data import (
 )
 from vorm.data.csv_loader import load_activities_csv
 from vorm.data.garmin import parse_gpx_folder
-from vorm.data.storage import ActivityStore, DailyLogEntry
+from vorm.data.storage import ActivityStore, CoachDecision, DailyLogEntry
 from vorm.data.strava import (
     STRAVA_ACTIVITY_SCOPE,
     StravaNotConfigured,
@@ -57,14 +57,23 @@ from vorm.metrics import (
 )
 from vorm.planning import PlanGenerationError, PlanGoal, generate_training_plan
 from vorm.rules import evaluate_safety_rules
+from vorm.validation import build_validation_report
 from vorm.ui import (
     acwr_chart,
     apply_theme,
     daily_load_chart,
     fitness_form_chart,
+    hr_zone_distribution_chart,
+    log_heatmap_chart,
+    longest_streak,
     pb_progression_chart,
+    render_fitness_form_explainer,
+    render_load_metrics_explainer,
+    render_onboarding_wizard,
     render_theme_selector,
     rpe_trend_chart,
+    should_show_onboarding,
+    streak_count,
     weekly_volume_chart,
 )
 
@@ -863,6 +872,26 @@ if cfg.has_supabase:
     if auth_user is None and not auth.is_guest():
         st.stop()
 
+# Onboarding wizard: shown once when a signed-in user has no saved profile.
+# Skipped for guests and anonymous-mode runs — both already work with sample
+# defaults and don't have a place to persist what the wizard would capture.
+if auth_user and not auth.is_guest():
+    existing_profile = _load_initial_profile()
+    has_saved_profile = (
+        st.session_state.get(_PROFILE_CACHE_KEY) != _PROFILE_MISSING
+        and isinstance(st.session_state.get(_PROFILE_CACHE_KEY), AthleteProfile)
+    )
+    if should_show_onboarding(has_profile=has_saved_profile):
+        def _save_onboarding_profile(p: AthleteProfile) -> None:
+            _get_user_store().save_profile(p)
+            st.session_state[_PROFILE_CACHE_KEY] = p
+
+        render_onboarding_wizard(
+            user_email=auth_user.email,
+            on_complete=_save_onboarding_profile,
+        )
+        st.stop()
+
 st.sidebar.title("🏃 Vorm.ai")
 st.sidebar.caption("AI-põhine treeningkoormuse analüüsija")
 
@@ -1021,9 +1050,9 @@ if latest_activity_date and analysis_date > latest_activity_date:
 current_summary = summarize_load(activities, profile, as_of=analysis_date)
 daily_load = build_load_timeseries(activities, profile, end=analysis_date)
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     ["Tänane soovitus", "Koormuse ajalugu", "Tippajad",
-     "Retrospektiivne test", "Treeningkava", "Päevalogi"]
+     "Retrospektiivne test", "Treeningkava", "Päevalogi", "Treeneri võrdlus"]
 )
 
 # --- Tab 1: today's recommendation
@@ -1051,6 +1080,8 @@ with tab1:
         f"{summary.monotony:.2f}" if summary.monotony is not None else "—",
         help="Foster monotony = 7-päeva mean / std. ≥ 2.0 = vähe varieeruvust.",
     )
+
+    render_load_metrics_explainer()
 
     if has_activities:
         hr_coverage = sum(1 for a in activities if a.avg_hr) / len(activities)
@@ -1207,6 +1238,15 @@ with tab2:
         "TSB +5…+25 = võistluseks valmis (rohelisel ribal)."
     )
     st.plotly_chart(fitness_form_chart(daily), width="stretch")
+    render_fitness_form_explainer()
+
+    st.markdown("#### HR-tsoonide nädalane jaotus")
+    st.caption(
+        "Iga jooks klassifitseeritakse keskmise pulsi järgi tsooni Z1–Z5 (Karvonen). "
+        "Kui pulsiandmeid pole, kasutatakse tempo-suhet künnis-tempoga. "
+        "Polariseeritud treening (Seiler): ~80% nädala mahust Z1–Z2, ~20% Z4–Z5."
+    )
+    st.plotly_chart(hr_zone_distribution_chart(activities, profile), width="stretch")
 
     st.markdown("#### Viimase 14 päeva kokkuvõte")
     recent_summary = _summary_table(activities, analysis_date)
@@ -1214,6 +1254,56 @@ with tab2:
         st.info("Viimase 14 päeva treeninguid pole.")
     else:
         st.dataframe(recent_summary, width="stretch", hide_index=True)
+
+    # Post-hoc RPE/notes editing. Persists to the local SQLite cache that
+    # `fetch_with_cache` reads from, so the next rerun shows the edits. Only
+    # offered for Strava-sourced activities — those have stable IDs that
+    # survive across runs. CSV/Garmin/sample IDs are ephemeral, so editing
+    # them would feel broken (next rerun would re-generate different IDs).
+    if source == _SOURCE_STRAVA and has_activities:
+        with st.expander("✏️ Muuda treeningu RPE / märkmeid"):
+            recent_activities = sorted(
+                activities, key=lambda a: a.activity_date, reverse=True,
+            )[:30]
+            label_for = {
+                a.id: (
+                    f"{a.activity_date.isoformat()} — {a.distance_km:.1f} km"
+                    + (f" — {(a.notes or '').strip()[:30]}" if a.notes else "")
+                )
+                for a in recent_activities
+            }
+            selected_id = st.selectbox(
+                "Treening",
+                options=[a.id for a in recent_activities],
+                format_func=lambda aid: label_for[aid],
+                key="edit_activity_select",
+            )
+            selected = next(a for a in recent_activities if a.id == selected_id)
+            col_rpe, col_notes = st.columns([1, 2])
+            new_rpe = col_rpe.slider(
+                "RPE (1-10)",
+                min_value=1, max_value=10,
+                value=selected.rpe or 5,
+                key=f"edit_rpe_{selected.id}",
+                help="Subjektiivne raskushinnang. Salvestub lokaalsesse Strava-vahemällu, "
+                "ei sünkroniseeru tagasi Stravasse.",
+            )
+            new_notes = col_notes.text_input(
+                "Märkmed",
+                value=selected.notes or "",
+                key=f"edit_notes_{selected.id}",
+                placeholder="Nt: kerge köha, jalg pinges, hea tempo viimasel km-l.",
+            )
+            if st.button("💾 Salvesta", key=f"save_edit_{selected.id}", type="primary"):
+                try:
+                    _get_local_store().set_rpe(
+                        selected.id, int(new_rpe), new_notes.strip() or None,
+                    )
+                except Exception as exc:
+                    st.error(f"Salvestamine ebaõnnestus: {exc}")
+                else:
+                    st.success("Salvestatud. Andmed värskenduvad kohe.")
+                    st.rerun()
 
 # --- Tab 3: personal bests
 with tab3:
@@ -1448,6 +1538,39 @@ with tab6:
             "_Hinda koormust_ ja täida päevalogi vorm."
         )
     else:
+        # Streak banner — sits above the table so the discipline metric is
+        # the first thing the user sees on this tab.
+        today_real = date.today()
+        current_streak = streak_count(logs, today_real)
+        best_streak = longest_streak(logs)
+        streak_cols = st.columns([1, 1, 2])
+        streak_cols[0].metric(
+            "🔥 Praegune seeria",
+            f"{current_streak} päeva",
+            help="Järjestikused päevad, mil oled päevalogi täitnud (kuni eilseni / täna).",
+        )
+        streak_cols[1].metric(
+            "🏆 Pikim seeria",
+            f"{best_streak} päeva",
+            help="Pikim järjestikune seeria kogu logimise ajaloo jooksul.",
+        )
+        with streak_cols[2]:
+            if current_streak >= 14:
+                st.success(
+                    f"§4.3 valideerimise lävi ({current_streak} ≥ 14 päeva) on täidetud."
+                )
+            else:
+                st.info(
+                    f"§4.3 valideerimisele on vaja 14 järjestikust päeva — "
+                    f"jäänud **{max(14 - current_streak, 0)}**."
+                )
+
+        st.plotly_chart(
+            log_heatmap_chart(logs, today_real, weeks=12),
+            width="stretch",
+        )
+        st.divider()
+
         followed_map = {"yes": "Jah", "partial": "Osaliselt", "no": "Ei", None: "—"}
         rows = [
             {
@@ -1512,3 +1635,232 @@ with tab6:
             file_name=f"vorm_daily_log_{date.today().isoformat()}.csv",
             mime="text/csv",
         )
+
+# --- Tab 7: coach comparison (Project Plan §4.2) -------------------------
+_CATEGORY_OPTIONS = (
+    "Jätka plaanipäraselt",
+    "Vähenda intensiivsust",
+    "Alternatiivne treening",
+    "Lisa taastumispäev",
+)
+_CAREFUL_CATEGORIES = {
+    "Vähenda intensiivsust", "Alternatiivne treening", "Lisa taastumispäev",
+}
+
+
+def _agreement_bucket(model: str, coach: str) -> str:
+    """match / close / wrong — same buckets as scripts/validate.py uses for §4.
+
+    `close` = both fall in the "careful" family (any reduce/alternative/recover),
+    `wrong` = one says "Jätka plaanipäraselt" while the other says be careful.
+    """
+    if model == coach:
+        return "match"
+    if model in _CAREFUL_CATEGORIES and coach in _CAREFUL_CATEGORIES:
+        return "close"
+    return "wrong"
+
+
+with tab7:
+    st.markdown(
+        "**Treeneri pimemenetluse võrdlus (§4.2).** Treener sisestab Vorm.ai "
+        "väljundit nägemata oma päevaotsuse iga päeva kohta, mille puhul on "
+        "olemas päevalogi. Kattuvus mõõdetakse kolmes ämbris: **match** (täpne "
+        "kategooria), **close** (mõlemad ettevaatlikud, aga erinev tüüp), "
+        "**wrong** (üks ütleb 'jätka', teine 'olge ettevaatlikud')."
+    )
+
+    coach_store = _get_user_store()
+    existing_logs = coach_store.list_daily_logs()
+    try:
+        existing_decisions = coach_store.list_coach_decisions()
+    except Exception:
+        existing_decisions = []
+
+    # --- Entry form
+    with st.expander("➕ Sisesta treeneri otsus", expanded=not existing_decisions):
+        log_dates = sorted({e.log_date for e in existing_logs}, reverse=True)
+        if not log_dates:
+            st.info(
+                "Päevalogi kirjeid pole — sisesta enne **Päevalogi** tabis vähemalt "
+                "üks päev, et oleks võrreldav baas."
+            )
+        else:
+            day_options = {d.isoformat(): d for d in log_dates}
+            decisions_by_date = {d.decision_date: d for d in existing_decisions}
+            with st.form("vorm_coach_decision_form", clear_on_submit=False):
+                selected_label = st.selectbox(
+                    "Kuupäev",
+                    options=list(day_options.keys()),
+                    key="_vorm_coach_date",
+                )
+                selected_day = day_options[selected_label]
+                existing = decisions_by_date.get(selected_day)
+
+                # Show coach the date + activity context but NOT the model's
+                # category — keeps the blind-comparison methodology intact.
+                same_day_log = next(
+                    (e for e in existing_logs if e.log_date == selected_day), None,
+                )
+                if same_day_log:
+                    st.caption(
+                        f"Mudeli soovitus selle päeva kohta on varjatud — sisesta "
+                        f"oma otsus enne, kui võrdluse all näed. "
+                        f"({selected_day.isoformat()})"
+                    )
+
+                coach_name = st.text_input(
+                    "Treeneri nimi",
+                    value=existing.coach_name if existing else "Ille Kukk",
+                    key="_vorm_coach_name",
+                )
+                default_idx = (
+                    _CATEGORY_OPTIONS.index(existing.recommended_category)
+                    if existing and existing.recommended_category in _CATEGORY_OPTIONS
+                    else 0
+                )
+                category = st.radio(
+                    "Treeneri soovitus",
+                    options=_CATEGORY_OPTIONS,
+                    index=default_idx,
+                    key="_vorm_coach_category",
+                )
+                rationale = st.text_area(
+                    "Põhjendus (1-2 lauset)",
+                    value=existing.rationale if existing and existing.rationale else "",
+                    key="_vorm_coach_rationale",
+                    placeholder="Nt: ACWR liiga kõrge, eile RPE 8 — täna kerge.",
+                    height=80,
+                )
+                notes = st.text_input(
+                    "Märkmed (valikuline)",
+                    value=existing.notes if existing and existing.notes else "",
+                    key="_vorm_coach_notes",
+                )
+                submitted = st.form_submit_button(
+                    "💾 Salvesta otsus", type="primary", width="stretch",
+                )
+                if submitted:
+                    try:
+                        coach_store.save_coach_decision(CoachDecision(
+                            decision_date=selected_day,
+                            coach_name=coach_name.strip() or "Ille Kukk",
+                            recommended_category=category,
+                            rationale=rationale.strip() or None,
+                            notes=notes.strip() or None,
+                        ))
+                    except Exception as exc:
+                        st.error(f"Salvestamine ebaõnnestus: {exc}")
+                    else:
+                        st.success(f"Otsus salvestatud ({selected_day.isoformat()}).")
+                        st.rerun()
+
+    # --- Comparison results
+    if not existing_decisions:
+        st.info(
+            "Treeneri otsuseid pole veel sisestatud. Lisa esimene otsus ülal — "
+            "kattuvuse arvutus tekib kohe, kui mõlemad pooled on olemas."
+        )
+    else:
+        log_by_date = {e.log_date: e for e in existing_logs}
+        pairs = []
+        for d in existing_decisions:
+            log = log_by_date.get(d.decision_date)
+            if log is None:
+                continue
+            pairs.append({
+                "Kuupäev": d.decision_date.isoformat(),
+                "Mudel": log.recommended_category,
+                "Treener": d.recommended_category,
+                "Kattuvus": _agreement_bucket(log.recommended_category, d.recommended_category),
+                "Põhjus (treener)": (d.rationale or "")[:80],
+            })
+
+        if not pairs:
+            st.warning(
+                "Ühelgi treeneri otsuse päeval pole vastavat päevalogi. "
+                "Lisa päevalogi sissekanne või vali teine kuupäev."
+            )
+        else:
+            n = len(pairs)
+            match = sum(1 for p in pairs if p["Kattuvus"] == "match")
+            close = sum(1 for p in pairs if p["Kattuvus"] == "close")
+            wrong = sum(1 for p in pairs if p["Kattuvus"] == "wrong")
+
+            metric_cols = st.columns(4)
+            metric_cols[0].metric(
+                "Võrreldud päevi", n,
+                help="§4.2 sihtmäär on 14 järjestikust päeva — kogutud andmete arv.",
+            )
+            metric_cols[1].metric(
+                "✓ Match",
+                f"{match} ({match / n * 100:.0f}%)",
+                help="Sama kategooria.",
+            )
+            metric_cols[2].metric(
+                "~ Close",
+                f"{close} ({close / n * 100:.0f}%)",
+                help="Mõlemad ettevaatlikud, erinev tüüp.",
+            )
+            metric_cols[3].metric(
+                "✗ Wrong",
+                f"{wrong} ({wrong / n * 100:.0f}%)",
+                help="Mudel ütleb jätka, treener ettevaatust või vastupidi.",
+            )
+
+            st.dataframe(
+                pd.DataFrame(pairs).rename(columns={"Kattuvus": "Kattuvuse ämber"}),
+                hide_index=True,
+                width="stretch",
+            )
+
+            # CSV download for the project report
+            coach_csv = pd.DataFrame([
+                {
+                    "decision_date": d.decision_date.isoformat(),
+                    "coach_name": d.coach_name,
+                    "coach_category": d.recommended_category,
+                    "coach_rationale": d.rationale or "",
+                    "coach_notes": d.notes or "",
+                    "model_category": (
+                        log_by_date[d.decision_date].recommended_category
+                        if d.decision_date in log_by_date else ""
+                    ),
+                    "agreement": (
+                        _agreement_bucket(
+                            log_by_date[d.decision_date].recommended_category,
+                            d.recommended_category,
+                        )
+                        if d.decision_date in log_by_date else ""
+                    ),
+                }
+                for d in existing_decisions
+            ]).to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 Lae treeneri võrdluse CSV-na",
+                data=coach_csv,
+                file_name=f"vorm_coach_comparison_{date.today().isoformat()}.csv",
+                mime="text/csv",
+            )
+
+    st.divider()
+    st.markdown("#### Valideerimisaruanne (PDF)")
+    st.caption(
+        "Pakib profiili, §4.3 igapäevase logimise koondnäitajad ja §4.2 treeneri "
+        "võrdluse ühte A4-PDF-i. Sobib otse projekti-aruandesse lisamiseks."
+    )
+    try:
+        pdf_bytes = build_validation_report(
+            profile=profile,
+            daily_logs=existing_logs,
+            coach_decisions=existing_decisions,
+        )
+        st.download_button(
+            "📄 Lae valideerimisaruanne PDF-na",
+            data=pdf_bytes,
+            file_name=f"vorm_validation_report_{date.today().isoformat()}.pdf",
+            mime="application/pdf",
+            type="primary",
+        )
+    except Exception as exc:
+        st.error(f"PDF-i genereerimine ebaõnnestus: {exc}")

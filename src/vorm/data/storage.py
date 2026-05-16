@@ -51,6 +51,23 @@ class DailyLogEntry:
     notes: str | None = None
     created_at: datetime | None = None
 
+
+@dataclass(frozen=True)
+class CoachDecision:
+    """One blind decision from the validating coach for Project Plan §4.2.
+
+    The coach records their independent recommendation for the same day the
+    model also produced one — comparison is computed in the UI layer.
+    """
+
+    decision_date: date
+    recommended_category: str
+    coach_name: str = "Ille Kukk"
+    rationale: str | None = None
+    notes: str | None = None
+    created_at: datetime | None = None
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS training_activities (
     id                   TEXT PRIMARY KEY,
@@ -98,6 +115,17 @@ CREATE TABLE IF NOT EXISTS strava_connection (
     athlete_name   TEXT,
     scope          TEXT,
     updated_at     TEXT NOT NULL
+);
+
+-- Coach decisions — Project Plan §4.2 blind comparison validation.
+-- One row per (athlete-day) since the local store is single-tenant.
+CREATE TABLE IF NOT EXISTS coach_decisions (
+    decision_date         TEXT PRIMARY KEY,
+    coach_name            TEXT NOT NULL DEFAULT 'Ille Kukk',
+    recommended_category  TEXT NOT NULL,
+    rationale             TEXT,
+    notes                 TEXT,
+    created_at            TEXT NOT NULL
 );
 """
 
@@ -329,6 +357,65 @@ class ActivityStore:
             ).fetchone()
         return _row_to_daily_log(row) if row else None
 
+    # --- Coach decisions (Project Plan §4.2) -----------------------------
+
+    def save_coach_decision(self, decision: CoachDecision) -> None:
+        created = (decision.created_at or datetime.now(UTC)).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO coach_decisions (
+                    decision_date, coach_name, recommended_category,
+                    rationale, notes, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(decision_date) DO UPDATE SET
+                    coach_name           = excluded.coach_name,
+                    recommended_category = excluded.recommended_category,
+                    rationale            = excluded.rationale,
+                    notes                = excluded.notes,
+                    created_at           = excluded.created_at
+                """,
+                (
+                    decision.decision_date.isoformat(),
+                    decision.coach_name,
+                    decision.recommended_category,
+                    decision.rationale,
+                    decision.notes,
+                    created,
+                ),
+            )
+
+    def get_coach_decision(self, day: date) -> CoachDecision | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM coach_decisions WHERE decision_date = ?",
+                (day.isoformat(),),
+            ).fetchone()
+        return _row_to_coach_decision(row) if row else None
+
+    def list_coach_decisions(
+        self, since: date | None = None, until: date | None = None,
+    ) -> list[CoachDecision]:
+        query = "SELECT * FROM coach_decisions WHERE 1=1"
+        params: list = []
+        if since:
+            query += " AND decision_date >= ?"
+            params.append(since.isoformat())
+        if until:
+            query += " AND decision_date <= ?"
+            params.append(until.isoformat())
+        query += " ORDER BY decision_date ASC"
+        with self._conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [_row_to_coach_decision(r) for r in rows]
+
+    def delete_coach_decision(self, day: date) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM coach_decisions WHERE decision_date = ?",
+                (day.isoformat(),),
+            )
+
 
 def _row_to_daily_log(row: sqlite3.Row) -> DailyLogEntry:
     created_at = None
@@ -345,6 +432,24 @@ def _row_to_daily_log(row: sqlite3.Row) -> DailyLogEntry:
         persuasiveness=row["persuasiveness"],
         followed=row["followed"],
         next_session_feeling=row["next_session_feeling"],
+        notes=row["notes"],
+        created_at=created_at,
+    )
+
+
+def _row_to_coach_decision(row: sqlite3.Row) -> CoachDecision:
+    created_at: datetime | None = None
+    raw = row["created_at"] if "created_at" in row.keys() else None
+    if raw:
+        try:
+            created_at = datetime.fromisoformat(raw)
+        except ValueError:
+            created_at = None
+    return CoachDecision(
+        decision_date=date.fromisoformat(row["decision_date"]),
+        recommended_category=row["recommended_category"],
+        coach_name=row["coach_name"] or "Ille Kukk",
+        rationale=row["rationale"],
         notes=row["notes"],
         created_at=created_at,
     )
