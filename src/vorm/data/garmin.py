@@ -37,7 +37,7 @@ from __future__ import annotations
 import math
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 from .models import TrainingActivity
@@ -47,6 +47,8 @@ _GPX_NS = {
     "tpx": "http://www.garmin.com/xmlschemas/TrackPointExtension/v1",
     "tpx2": "http://www.garmin.com/xmlschemas/TrackPointExtension/v2",
 }
+
+_EARTH_RADIUS_M = 6371000.0
 
 # Garmin's GPX `<type>` field uses lowercase singular words. We accept anything
 # starting with "run" so trail_run / virtual_run / treadmill_running also pass.
@@ -117,14 +119,16 @@ def _extract_hr(trkpt: ET.Element) -> int | None:
     ext = trkpt.find("gpx:extensions", _GPX_NS)
     if ext is None:
         return None
-    for ns in ("tpx", "tpx2"):
-        for elem in ext.iter():
-            tag = elem.tag.split("}", 1)[-1]
-            if tag == "hr" and elem.text:
-                try:
-                    return int(float(elem.text))
-                except ValueError:
-                    continue
+    # Walk all child elements (any TrackPointExtension namespace version), pick
+    # the first one whose local name is "hr". Garmin uses v1 and v2; this
+    # accepts both without hard-coding either.
+    for elem in ext.iter():
+        tag = elem.tag.split("}", 1)[-1]
+        if tag == "hr" and elem.text:
+            try:
+                return int(float(elem.text))
+            except ValueError:
+                continue
     return None
 
 
@@ -183,13 +187,12 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
     Standard haversine; accuracy is fine at running scales (<50 km segments).
     """
-    R = 6371000.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
+    return 2 * _EARTH_RADIUS_M * math.asin(math.sqrt(a))
 
 
 def load_garmin_folder(folder: str | Path) -> Iterable[TrainingActivity]:

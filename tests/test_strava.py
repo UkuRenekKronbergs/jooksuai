@@ -9,7 +9,7 @@ one-day backstep; API failure → cache is still returned).
 from __future__ import annotations
 
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -70,7 +70,7 @@ def test_cold_cache_fetches_full_window(tmp_path, fake_stravalib):
 
     after_arg = fake_stravalib.client.get_activities.call_args.kwargs["after"]
     expected_min = datetime.combine(today - timedelta(days=60), datetime.min.time(),
-                                    tzinfo=timezone.utc)
+                                    tzinfo=UTC)
     assert after_arg == expected_min
 
 
@@ -112,7 +112,7 @@ def test_warm_cache_only_asks_for_delta(tmp_path, fake_stravalib):
     # Verify the delta query used the one-day backstep, not the full window.
     after_arg = fake_stravalib.client.get_activities.call_args.kwargs["after"]
     expected_sync_from = datetime.combine(date(2026, 5, 9), datetime.min.time(),
-                                          tzinfo=timezone.utc)
+                                          tzinfo=UTC)
     assert after_arg == expected_sync_from
 
     # The edited name should have been persisted via upsert.

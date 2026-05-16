@@ -10,7 +10,7 @@ import json
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from .models import AthleteProfile, TrainingActivity
@@ -202,7 +202,7 @@ class ActivityStore:
         ):
             if value is not None and not (1 <= value <= 5):
                 raise ValueError(f"{field_name} must be in 1..5 or None, got {value!r}")
-        created = (entry.created_at or datetime.now(timezone.utc)).isoformat()
+        created = (entry.created_at or datetime.now(UTC)).isoformat()
         with self._conn() as conn:
             conn.execute(
                 """
