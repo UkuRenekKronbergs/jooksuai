@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+
 from vorm.data.models import AthleteProfile, TrainingActivity
-from vorm.data.storage import ActivityStore
+from vorm.data.storage import ActivityStore, DailyLogEntry
 
 
 def test_profile_roundtrip_preserves_threshold_pace(tmp_path):
@@ -69,3 +71,70 @@ def test_activity_upsert_and_list(tmp_path):
     a1 = next(a for a in listed if a.id == "a1")
     assert a1.distance_km == 10.5
     assert a1.rpe == 5  # COALESCE preserved the original RPE
+
+
+def test_daily_log_roundtrip(tmp_path):
+    store = ActivityStore(tmp_path / "store.db")
+    entry = DailyLogEntry(
+        log_date=date(2026, 5, 18),
+        recommended_category="Vähenda intensiivsust",
+        rationale_excerpt="ACWR 1.45, RPE 8 eile",
+        usefulness=4,
+        persuasiveness=5,
+        followed="yes",
+        next_session_feeling=4,
+        notes="Tegin asemel kerge 8 km.",
+    )
+    store.save_daily_log(entry)
+
+    loaded = store.get_daily_log(date(2026, 5, 18))
+    assert loaded is not None
+    assert loaded.recommended_category == "Vähenda intensiivsust"
+    assert loaded.usefulness == 4
+    assert loaded.followed == "yes"
+    assert loaded.notes == "Tegin asemel kerge 8 km."
+    assert loaded.created_at is not None  # auto-stamped
+
+
+def test_daily_log_upsert_replaces_existing(tmp_path):
+    store = ActivityStore(tmp_path / "store.db")
+    day = date(2026, 5, 18)
+    store.save_daily_log(DailyLogEntry(
+        log_date=day, recommended_category="Jätka plaanipäraselt",
+        usefulness=3, followed="yes",
+    ))
+    # Athlete reconsiders later in the day — overwrites the same row.
+    store.save_daily_log(DailyLogEntry(
+        log_date=day, recommended_category="Jätka plaanipäraselt",
+        usefulness=2, followed="partial", notes="Lõpetasin treeningu varakult",
+    ))
+    loaded = store.get_daily_log(day)
+    assert loaded.usefulness == 2
+    assert loaded.followed == "partial"
+    assert loaded.notes == "Lõpetasin treeningu varakult"
+
+
+def test_daily_log_list_filters_by_range(tmp_path):
+    store = ActivityStore(tmp_path / "store.db")
+    for d in (date(2026, 5, 17), date(2026, 5, 18), date(2026, 5, 25)):
+        store.save_daily_log(DailyLogEntry(
+            log_date=d, recommended_category="Jätka plaanipäraselt",
+        ))
+    in_range = store.list_daily_logs(since=date(2026, 5, 18), until=date(2026, 5, 24))
+    assert [e.log_date for e in in_range] == [date(2026, 5, 18)]
+
+
+def test_daily_log_validates_scale_inputs(tmp_path):
+    store = ActivityStore(tmp_path / "store.db")
+    with pytest.raises(ValueError, match="usefulness"):
+        store.save_daily_log(DailyLogEntry(
+            log_date=date(2026, 5, 18),
+            recommended_category="Jätka plaanipäraselt",
+            usefulness=7,
+        ))
+    with pytest.raises(ValueError, match="followed"):
+        store.save_daily_log(DailyLogEntry(
+            log_date=date(2026, 5, 18),
+            recommended_category="Jätka plaanipäraselt",
+            followed="maybe",
+        ))

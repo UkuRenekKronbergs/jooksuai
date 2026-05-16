@@ -6,17 +6,46 @@ and we want the Streamlit app to Just Work after a long idle.
 
 Per the project plan (privacy): we pull the aggregate fields only — no GPS
 streams or raw HR time-series leave the device.
+
+This module exposes two entry points:
+
+- `fetch_recent_activities()` — pull a fresh window from Strava every time.
+  Simple, but burns API quota; useful for one-shot scripts.
+- `fetch_with_cache()` — **delta-sync** against a local SQLite store. On a
+  warm cache, only the day after the latest cached activity is asked of the
+  API. This is the Plan B from Project Plan §5 Risk 2: "Lokaalne SQLite
+  vahemälu tagab, et iga treening päritakse ainult üks kord."
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 from .models import TrainingActivity
+from .storage import ActivityStore
 
 
 class StravaNotConfigured(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class StravaSyncResult:
+    """Bookkeeping returned by `fetch_with_cache()`.
+
+    `fetched_from_api` excludes already-cached activities, so the caller can
+    surface a meaningful "synced N new, X cached" line. `latest_cached_date`
+    is the most recent activity date *after* the sync — useful for offline
+    indicators in the UI.
+    """
+
+    activities: list[TrainingActivity]
+    fetched_from_api: int
+    cache_hits: int
+    latest_cached_date: date | None
+    api_called: bool
 
 
 def fetch_recent_activities(
@@ -26,15 +55,90 @@ def fetch_recent_activities(
     refresh_token: str | None,
     days: int = 60,
 ) -> list[TrainingActivity]:
+    """Pull `days` worth of activities from Strava without consulting the cache."""
+    if not (client_id and client_secret and refresh_token):
+        raise StravaNotConfigured(
+            "Strava credentials missing — set STRAVA_CLIENT_ID / _SECRET / _REFRESH_TOKEN in .env"
+        )
+    client = _authed_client(client_id, client_secret, refresh_token)
+    after = datetime.now(UTC) - timedelta(days=days)
+    return list(_pull_runs_after(client, after))
+
+
+def fetch_with_cache(
+    *,
+    client_id: str | None,
+    client_secret: str | None,
+    refresh_token: str | None,
+    cache_db: Path,
+    days: int = 60,
+    today: date | None = None,
+) -> StravaSyncResult:
+    """Cache-aware fetch. Asks Strava only for the delta since the latest cache row.
+
+    Semantics:
+
+    - The local SQLite store holds every activity ever fetched. We never delete.
+    - On call, we look up the latest cached `activity_date`. The Strava query
+      uses `after = max(latest_cached - 1 day, window_start)` — a one-day overlap
+      lets us pick up edits to the most recent activity (Strava lets athletes
+      edit name/distance for a while after upload).
+    - On a cold cache, we fall back to a full `days`-day window.
+    - On any API failure (network, 429, etc.), the cache is still returned —
+      stale > empty.
+
+    Returns the union of (still-fresh cache + newly-pulled rows), trimmed to
+    the requested `days` window.
+    """
     if not (client_id and client_secret and refresh_token):
         raise StravaNotConfigured(
             "Strava credentials missing — set STRAVA_CLIENT_ID / _SECRET / _REFRESH_TOKEN in .env"
         )
 
+    today = today or datetime.now(UTC).date()
+    window_start = today - timedelta(days=days)
+    store = ActivityStore(cache_db)
+    latest_cached = store.latest_activity_date()
+
+    # One-day backstep so we re-fetch the most recent day in case the athlete
+    # tweaked it on Strava after upload.
+    sync_from = window_start
+    if latest_cached and latest_cached > window_start:
+        sync_from = latest_cached - timedelta(days=1)
+
+    fresh: list[TrainingActivity] = []
+    api_called = False
+    try:
+        client = _authed_client(client_id, client_secret, refresh_token)
+        fresh = list(
+            _pull_runs_after(client, datetime.combine(sync_from, datetime.min.time(), tzinfo=UTC))
+        )
+        api_called = True
+    except Exception:
+        # Network / 429 / stravalib hiccup: do *not* lose the cached activities.
+        # The caller can log / surface this; we return what we have.
+        if not store.list_activities(since=window_start):
+            raise
+
+    fetched_from_api = store.upsert_activities(fresh)
+    all_in_window = store.list_activities(since=window_start, until=today)
+    cache_hits = max(len(all_in_window) - fetched_from_api, 0)
+    return StravaSyncResult(
+        activities=all_in_window,
+        fetched_from_api=fetched_from_api,
+        cache_hits=cache_hits,
+        latest_cached_date=store.latest_activity_date(),
+        api_called=api_called,
+    )
+
+
+def _authed_client(client_id: str, client_secret: str, refresh_token: str):
     try:
         from stravalib import Client
     except ImportError as exc:
-        raise RuntimeError("stravalib not installed — run `pip install stravalib`") from exc
+        raise RuntimeError(
+            "stravalib not installed — run `pip install stravalib`"
+        ) from exc
 
     client = Client()
     token_response = client.refresh_access_token(
@@ -43,14 +147,14 @@ def fetch_recent_activities(
         refresh_token=refresh_token,
     )
     client.access_token = token_response["access_token"]
+    return client
 
-    after = datetime.now(UTC) - timedelta(days=days)
-    activities: list[TrainingActivity] = []
+
+def _pull_runs_after(client, after: datetime):
     for a in client.get_activities(after=after):
         if not _is_running(a.type):
             continue
-        activities.append(_map_activity(a))
-    return activities
+        yield _map_activity(a)
 
 
 def _is_running(activity_type) -> bool:

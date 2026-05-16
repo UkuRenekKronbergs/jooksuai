@@ -1,3 +1,4 @@
+from .forecast import ACWRForecast, forecast_acwr, forecast_message
 from .load import (
     LoadSummary,
     acwr_series,
@@ -17,6 +18,7 @@ from .personal_bests import (
 )
 
 __all__ = [
+    "ACWRForecast",
     "LoadSummary",
     "PB_DISTANCES",
     "PersonalBest",
@@ -27,6 +29,8 @@ __all__ = [
     "estimate_rpe_from_hr",
     "find_personal_bests",
     "fitness_form",
+    "forecast_acwr",
+    "forecast_message",
     "progression_at_distance",
     "summarize_load",
     "trimp",

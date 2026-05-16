@@ -14,12 +14,14 @@ Harrastus- ja poolprofessionaalsetel jooksjatel on palju andmeid (nutikell, GPS,
 
 ## Mis rakendus teeb
 
-- **Ostab endasse** viimase 60 päeva treeningud (Strava API / Strava-eksport CSV / lokaalne näidisandmestik).
+- **Ostab endasse** viimase 60 päeva treeningud (Strava API cache'iga / Strava-eksport CSV / Garmin GPX-kaust / lokaalne näidisandmestik).
 - **Arvutab** akuutne 7-päeva koormus, krooniline 28-päeva koormus, ACWR, Banisteri TRIMP, Fosteri monotoonsus ja strain. Pulsiandmete puudumisel kasutab tempo-põhist rTSS-stiilis fallback'i (künnis-tempo tuletub 10 km PB-st).
 - **Käivitab ohutusreeglid** — kui ACWR > 1.5, RPE ≥ 8 kaks päeva järjest, haigus või uni < 6 h, sunnitakse vastus ohutu kategooria suunas.
-- **Küsib LLM-ilt soovituse** neljas kategoorias (jätka / vähenda / taastumispäev / alternatiivne) koos 2–4-lauselise põhjendusega.
+- **Prognoosib ACWR-trendi** scikit-learn lineaarse regressiooniga (viimased 14 päeva) — hoiatab juba enne, kui kasvav trend lõikab läbi ohulõike 1.5.
+- **Küsib LLM-ilt soovituse** neljas kategoorias (jätka / vähenda / taastumispäev / alternatiivne) koos 2–4-lauselise põhjendusega. Toetab 3 prompti-varianti A/B-testimiseks (`baseline` / `numeric` / `conservative`).
 - **Näitab** ACWR-kõverat, päevakoormust, nädalamahtu ja RPE-trendi Plotly-interaktiivgraafikutena.
 - **Retrospektiivne test** — vali mineviku kuupäev, näita mudeli soovitust nii, nagu see päev oleks olnud täna.
+- **Päeva-päeva kasutusslog** — pärast soovitust salvesta 1–5 hinnang kasulikkusele ja veenvusele, kas järgisid, ja järgmise treeningu enesetunne. Vajalik valideerimise §4.3 jaoks.
 - **Treeningkava** — genereerib täieliku päev-haaval struktureeritud võistluse-ettevalmistuse kava (base → build → peak → taper), arvestades sinu praegust vormi ja tippaegu. CSV-eksport TrainingPeaksi-sõbralik.
 
 ## Kiire alustamine
@@ -37,7 +39,10 @@ pip install -e .                    # registreerib `vorm` paketi Pythoni teele
 
 # 3. (Valikuline) LLM ja Strava võtmed
 cp .env.example .env
-# Sisesta oma ANTHROPIC_API_KEY (või OPENAI_API_KEY) .env-faili
+# Sisesta üks järgmistest: ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY.
+# Provideri valimiseks sea LLM_PROVIDER=anthropic|openai|openrouter (vaikimisi: anthropic).
+# Mudeli valimiseks sea LLM_MODEL (nt openrouter puhul: anthropic/claude-sonnet-4.6,
+# deepseek/deepseek-v4-flash, meta-llama/llama-3.3-70b-instruct jne).
 
 # 4. (Valikuline) Strava OAuth — üks kord, produceerib refresh_tokeni
 python scripts/strava_bootstrap.py
@@ -47,6 +52,10 @@ streamlit run app.py
 ```
 
 Esimesel käivitamisel kasuta **Näidisandmed**-valikut — 90 päeva deterministlikult genereeritud näidisjooksu valmistavad terve UI demoks ette. Ilma LLM-võtmeta jookseb kõik peale soovituse teksti — ACWR, graafikud ja reeglitepõhine vastus töötavad ka offline.
+
+### Strava-andmete vahemälu
+
+Kui valid sidebari **Strava API**, kasutab rakendus `fetch_with_cache()`-i: lokaalsesse SQLite-faili (`data/cache/activities.sqlite`) salvestatakse iga kunagi päritud treening. Igal järgneval käivitusel küsitakse Stravalt ainult delta (alates viimase cache-treeningu kuupäevast − 1 päev, et viimase päeva nimetuse muudatused korjata). API tõrke korral (429, võrk maas) tagastatakse vahemälu sisu — sünk ei kaota andmeid. Vt projekti plaan §5 Risk 2.
 
 ## Andmete formaat
 
@@ -73,18 +82,20 @@ src/vorm/
 ├── config.py                # env-põhine konfiguratsioon (Config dataclass)
 ├── data/
 │   ├── models.py            # TrainingActivity, AthleteProfile, DailySubjective
-│   ├── storage.py           # SQLite vahemälu
-│   ├── strava.py            # stravalib-põhine OAuth-klient
+│   ├── storage.py           # SQLite vahemälu + päeva-logi (§4.3)
+│   ├── strava.py            # stravalib OAuth-klient + cache-teadlik delta-sync
+│   ├── garmin.py            # GPX-kaust fallback parser (§5 Risk 2)
 │   ├── csv_loader.py        # Natiivne + Strava-eksport parser
 │   ├── polar.py             # Polar Flow JSON → Strava HR-täiendus
 │   └── sample.py            # Deterministlik näidisgeneraator
 ├── metrics/
 │   ├── load.py              # TRIMP, ACWR, monotoonsus, Banister CTL/ATL/TSB, RPE-süntees
+│   ├── forecast.py          # sklearn ACWR-trend prognoos (§2 statistiline turvafilter)
 │   └── personal_bests.py    # Tippajad standard-distantsidele
 ├── rules/
 │   └── safety.py            # Reeglipõhised ohutusfiltrid
 ├── llm/
-│   ├── prompts.py           # Igapäevane prompt + few-shot näited
+│   ├── prompts.py           # Igapäevane prompt + few-shot näited + 3 A/B-varianti
 │   ├── _json_utils.py       # Tolerantne JSON-parser (avatud mudelite jaoks)
 │   └── client.py            # Anthropic + OpenAI + OpenRouter taustakliendid
 ├── planning/
@@ -95,7 +106,9 @@ src/vorm/
     └── charts.py            # Plotly graafikud
 app.py                       # Streamlit entry point
 scripts/
-└── enrich_strava_with_polar.py   # CLI: Polari pulsiandmed Strava CSV-sse
+├── enrich_strava_with_polar.py   # CLI: Polari pulsiandmed Strava CSV-sse
+├── strava_bootstrap.py           # CLI: Strava OAuth refresh-token genereerimine
+└── validate.py                   # CLI: PROJECT_PLAN §4 valideerimisharness
 ```
 
 Andmevoog:
@@ -115,23 +128,54 @@ pip install ruff
 ruff check .
 ```
 
-Unit-testid katavad praegu:
+Unit-testid katavad praegu (106 testi):
 - Banisteri TRIMP-i käsitsi arvutatud referentsväärtused
 - ACWR konvergeerub 1.0-le konstantse koormuse juures
 - ACWR hüppab ohupiirile, kui 7-päeva koormus kolmekordistub
 - Monotoonsus = None nullvariantsi puhul
 - Safety rules — iga reegli fire-kontekst + precedence order
 - CSV-parseri mõlemad formaadid
+- Strava delta-sync: külm/soe vahemälu, API tõrke fallback, mitte-jooks filtreering
+- Garmin GPX-parser: HR-aggregatsioon, mitte-jooksu filtreering, kaust-laadimine
+- ACWR-trend regressioon: tasakaalu trend, danger-crossing, müra-supressioon
+- Päeva-logi SQLite roundtrip + upsert + skaala-valideerimine
 
 CI töötab GitHub Actionsis iga push-i peal Python 3.11 ja 3.12 all.
 
 ## Valideerimisplaan
 
-Projekt valideeritakse kolmes etapis (vt [PROJECT_PLAN.md](PROJECT_PLAN.md) jaotis 4):
+Projekt valideeritakse nelja etapina (vt [PROJECT_PLAN.md](PROJECT_PLAN.md) jaotis 4):
 
 1. **Retrospektiivne test** 30 varasemal päeval (sh 5–7 teadaolevalt „kriitilist" päeva). Edu = ≥ 70% kattumist mu omaaegse otsusega.
 2. **Treeneri kõrvutus** 14 järjestikusel päeval (18.05 – 01.06). Treener Ille Kukk hindab samu sisendeid ilma mudeli väljundit nägemata.
-3. **Kvalitatiivne intervjuu** 2 treeningkaaslasega projekti lõpus.
+3. **Isiklik igapäevane kasutus** 14 päeva järjest — UI-s päeva-logi (`Päeva-logi` tab), kus iga päev login: kasulikkus (1–5), veenvus (1–5), kas järgisin, järgmise treeningu enesetunne (1–5).
+4. **Kvalitatiivne intervjuu** 2 treeningkaaslasega projekti lõpus. Skript: [docs/interview_script.md](docs/interview_script.md) (6 pool-struktureeritud küsimust).
+
+### Valideerimisharness
+
+[`scripts/validate.py`](scripts/validate.py) on automatiseeritud harness etappide 1 ja 2 jaoks. Kasutab pikendatud näidisandmestikku (Jan 2026 – 1. juuni 2026, sh kaks tehislikult induce'itud ülekoormusakent ja üks haiguseaken), arvutab iga päeva koormusnäitajad sama torujuhtmega nagu live-rakendus, ja võrdleb mudeli soovitust simuleeritud sportlase + treeneri otsustega. Päris valideerimine asendab simuleeritud otsused logitud tõe-väärtustega.
+
+```bash
+# Reegli-režiim (offline, kohene, deterministlik)
+python scripts/validate.py
+
+# LLM-režiim — kasutab .env-i providerit (Anthropic / OpenAI / OpenRouter)
+python scripts/validate.py --llm
+
+# Sundi värsked LLM-päringud (ignoreeri validation_llm_cache.json)
+python scripts/validate.py --llm --no-cache
+
+# Suitsutest — 5 päeva kummalgi etapil
+python scripts/validate.py --llm --limit 5
+
+# A/B-testi prompti varianti (baseline / numeric / conservative)
+python scripts/validate.py --llm --prompt-variant numeric
+```
+
+Väljundid:
+- `validation_report.md` — markdown-aruanne (kokkuvõte, metoodika, päeva-tabelid, lahkuminekute klassifikatsioon).
+- `validation_data.csv` — per-day võrdlustabel.
+- `validation_llm_cache.json` — ainult `--llm` režiimis; LLM-vastused (cache-võti = sisendi hash + mudel + prompti versioon, automaatne invalideerimine).
 
 ## Privaatsus
 

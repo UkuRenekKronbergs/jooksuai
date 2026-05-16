@@ -19,7 +19,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from vorm.config import load_config
+from vorm.config import CACHE_DIR, load_config
 from vorm.data import (
     AthleteProfile,
     DailySubjective,
@@ -28,12 +28,17 @@ from vorm.data import (
     load_sample_profile,
 )
 from vorm.data.csv_loader import load_activities_csv
-from vorm.data.strava import StravaNotConfigured, fetch_recent_activities
+from vorm.data.garmin import parse_gpx_folder
+from vorm.data.storage import ActivityStore, DailyLogEntry
+from vorm.data.strava import StravaNotConfigured, fetch_with_cache
 from vorm.llm import LLMNotAvailable, build_prompt, generate_recommendation
 from vorm.metrics import (
     PB_DISTANCES,
+    acwr_series,
     build_load_timeseries,
     find_personal_bests,
+    forecast_acwr,
+    forecast_message,
     summarize_load,
 )
 from vorm.planning import PlanGenerationError, PlanGoal, generate_training_plan
@@ -69,14 +74,41 @@ def _get_activities(source: str, uploaded_csv, days: int, cfg) -> list[TrainingA
         except Exception as exc:
             st.error(f"CSV-i lugemine ebaõnnestus: {exc}")
             return []
+    if source == "Garmin GPX-kaust":
+        folder = st.session_state.get("garmin_folder", "").strip()
+        if not folder:
+            st.info("Sisesta vasakul Garmin GPX-i ekspordi kausta tee.")
+            return []
+        from pathlib import Path as _P
+        path = _P(folder)
+        if not path.is_dir():
+            st.error(f"Kaust '{folder}' ei eksisteeri. Eksporti Garmin Connectist GPX-failid sellesse kausta.")
+            return []
+        try:
+            return parse_gpx_folder(path)
+        except Exception as exc:
+            st.error(f"GPX-failide lugemine ebaõnnestus: {exc}")
+            return []
     if source == "Strava API":
         try:
-            return fetch_recent_activities(
+            result = fetch_with_cache(
                 client_id=cfg.strava_client_id,
                 client_secret=cfg.strava_client_secret,
                 refresh_token=cfg.strava_refresh_token,
+                cache_db=CACHE_DIR / "activities.sqlite",
                 days=days,
             )
+            if result.api_called:
+                msg = f"Strava sünk: {result.fetched_from_api} uut + {result.cache_hits} vahemälust"
+                if result.latest_cached_date:
+                    msg += f" (viimane: {result.latest_cached_date.isoformat()})"
+                st.success(msg)
+            else:
+                st.info(
+                    f"Strava API ei vastanud — kasutan vahemälu "
+                    f"({result.cache_hits} treeningut)."
+                )
+            return result.activities
         except StravaNotConfigured as exc:
             st.error(str(exc))
             return []
@@ -184,6 +216,73 @@ def _render_safety_flags(verdict):
             st.warning(f"**{f.code}** — {f.message}")
 
 
+@st.cache_resource
+def _get_store() -> ActivityStore:
+    """SQLite store shared across reruns; cached so we don't reopen per click."""
+    return ActivityStore(CACHE_DIR / "activities.sqlite")
+
+
+def _render_daily_log_form(
+    log_day: date,
+    recommended_category: str,
+    rationale: str | None,
+) -> None:
+    """Project Plan §4.3 — collect the athlete's daily reaction to the rec."""
+    store = _get_store()
+    existing = store.get_daily_log(log_day)
+    with st.form(f"daily_log_{log_day.isoformat()}", clear_on_submit=False):
+        st.markdown(f"#### Päeva-logi — {log_day.isoformat()}")
+        st.caption(
+            "Salvesta enda hinnang soovitusele. Annab valideerimisele §4.3 "
+            "vajaminevad andmed (kasulikkus, järgimine, järgmise treeningu enesetunne)."
+        )
+        col1, col2 = st.columns(2)
+        usefulness = col1.slider(
+            "Soovituse kasulikkus (1–5)", 1, 5,
+            value=existing.usefulness if existing and existing.usefulness else 3,
+        )
+        persuasiveness = col2.slider(
+            "Põhjenduse veenvus (1–5)", 1, 5,
+            value=existing.persuasiveness if existing and existing.persuasiveness else 3,
+        )
+        followed_options = ["Jah", "Osaliselt", "Ei"]
+        followed_default = (
+            {"yes": 0, "partial": 1, "no": 2}.get(existing.followed, 0)
+            if existing else 0
+        )
+        followed_label = st.radio(
+            "Kas järgisid soovitust?", followed_options,
+            index=followed_default, horizontal=True,
+        )
+        next_feeling = st.slider(
+            "Järgmise treeningu enesetunne (1 = halb, 5 = väga hea)", 1, 5,
+            value=existing.next_session_feeling if existing and existing.next_session_feeling else 3,
+        )
+        notes = st.text_area(
+            "Märkmed (valikuline)",
+            value=existing.notes if existing else "",
+            placeholder="Nt: lõpetasin treeningu 15 min varem, jalg pinges.",
+            height=70,
+        )
+        submitted = st.form_submit_button("💾 Salvesta päeva-logi", type="primary")
+        if submitted:
+            followed_code = {"Jah": "yes", "Osaliselt": "partial", "Ei": "no"}[followed_label]
+            store.save_daily_log(DailyLogEntry(
+                log_date=log_day,
+                recommended_category=recommended_category,
+                rationale_excerpt=(rationale or "")[:500] or None,
+                usefulness=usefulness,
+                persuasiveness=persuasiveness,
+                followed=followed_code,
+                next_session_feeling=next_feeling,
+                notes=notes.strip() or None,
+            ))
+            if existing:
+                st.success(f"Päeva-logi uuendatud ({log_day.isoformat()}).")
+            else:
+                st.success(f"Päeva-logi salvestatud ({log_day.isoformat()}).")
+
+
 _WEEKDAY_ET = ["Esmaspäev", "Teisipäev", "Kolmapäev", "Neljapäev", "Reede", "Laupäev", "Pühapäev"]
 _PHASE_ET = {
     "base": "Baas",
@@ -257,9 +356,9 @@ cfg = load_config()
 st.sidebar.title("🏃 Vorm.ai")
 st.sidebar.caption("AI-põhine treeningkoormuse analüüsija")
 
-data_source_options = ["Näidisandmed", "CSV-fail"]
+data_source_options = ["Näidisandmed", "CSV-fail", "Garmin GPX-kaust"]
 if cfg.has_strava:
-    data_source_options.append("Strava API")
+    data_source_options.insert(2, "Strava API")  # Strava enne Garmin-fallback'it
 
 source = st.sidebar.radio("Andmeallikas", data_source_options)
 days = st.sidebar.slider("Päevade arv", min_value=28, max_value=180, value=90, step=7)
@@ -271,6 +370,15 @@ if source == "CSV-fail":
         type=["csv"],
         help="Natiivne formaat: id, activity_date, activity_type, distance_km, duration_min, avg_hr, rpe, notes. "
         "Strava-eksport (Activity Date, Distance jne) töötab samuti.",
+    )
+
+if source == "Garmin GPX-kaust":
+    st.sidebar.text_input(
+        "Garmin GPX-i ekspordi kaust",
+        key="garmin_folder",
+        placeholder="C:/Users/.../GarminExport",
+        help="Garmin Connect → tegevuse leht → ⚙ → Export GPX. Lae kõik failid ühte kausta. "
+        "Project Plan §5 Risk 2 fallback Stravale.",
     )
 
 st.sidebar.divider()
@@ -305,13 +413,28 @@ if cfg.has_llm:
 else:
     st.sidebar.info("LLM pole seadistatud — reeglivastus kuvatakse. Lisa ANTHROPIC_API_KEY .env-i täieliku analüüsi jaoks.")
 
+st.sidebar.divider()
+st.sidebar.markdown(
+    "**⚠ Vastutuspiir.** Tööriist on **otsustustugi**, mitte asendaja "
+    "treenerile ega arstile. **Vigastuse, valu või haiguskahtluse puhul** "
+    "lõpeta treening ja pöördu spetsialisti poole — mudel ei tee meditsiinilist "
+    "hinnangut."
+)
+
 # --- Main -----------------------------------------------------------------
 
 st.title("Treeningkoormuse analüüs")
-st.caption(
-    "Tööriist on otsustustugi, mitte asendaja treenerile ega arstile. "
-    "Vigastuse või haiguse kahtluse korral pöördu spetsialisti poole."
-)
+# Top-level disclaimer banner. Repeats the sidebar callout so users entering
+# from a deep-link or scroll-to-tab still see the limits before reading any
+# recommendation. Project Plan §5 "Vastutuspiir".
+with st.container(border=True):
+    st.markdown(
+        "**Vastutuspiir.** Vorm.ai on **otsustustugi** — andmepõhine teine arvamus, "
+        "mitte asendaja kvalifitseeritud treenerile ega arstile. Soovitus tugineb "
+        "ainult sinu logitud objektiivsele koormusele + subjektiivsele enesetundele; "
+        "**vigastuse, ägeda valu või haiguskahtluse puhul** lõpeta treening ja "
+        "pöördu treeneri/arsti poole. Mudel ei diagnoosi ega ravi."
+    )
 
 if not activities:
     st.info("Andmed pole veel laaditud. Vali vasakul andmeallikas või lae CSV.")
@@ -325,8 +448,9 @@ if analysis_date > latest_activity_date:
         "ACWR ja akuutne TRIMP võivad näidata 0. Liiguta kuupäev tagasi viimasele trenni-päevale."
     )
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Tänane soovitus", "Koormuse ajalugu", "Tippajad", "Retrospektiivne test", "Treeningkava"]
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Tänane soovitus", "Koormuse ajalugu", "Tippajad",
+     "Retrospektiivne test", "Treeningkava", "Päeva-logi"]
 )
 
 # --- Tab 1: today's recommendation
@@ -395,6 +519,18 @@ with tab1:
         verdict = evaluate_safety_rules(summary, subjective)
         _render_safety_flags(verdict)
 
+        # Statistiline turvafilter (PROJECT_PLAN §2): kui ACWR trend tõuseb,
+        # näita projektsiooni ja "ületab ohu" hoiatust enne reegli fire-imist.
+        daily_for_forecast = build_load_timeseries(activities, profile, end=analysis_date)
+        acwr_ts = acwr_series(daily_for_forecast)["acwr"]
+        acwr_forecast = forecast_acwr(acwr_ts)
+        forecast_msg = forecast_message(acwr_forecast)
+        if forecast_msg:
+            if acwr_forecast and acwr_forecast.crosses_danger_in_days is not None:
+                st.warning(f"📈 {forecast_msg}")
+            else:
+                st.info(f"📈 {forecast_msg}")
+
     st.divider()
 
     if st.button("Hinda koormust", type="primary", width="stretch"):
@@ -424,6 +560,13 @@ with tab1:
 
         with st.expander("Näita LLM-i kasutatud prompti (diagnostika)"):
             st.code(prompt_bundle.user, language="markdown")
+
+        st.divider()
+        _render_daily_log_form(
+            log_day=analysis_date,
+            recommended_category=(llm_result.category if llm_result else verdict.recommendation.value),
+            rationale=(llm_result.rationale if llm_result else None),
+        )
 
 # --- Tab 2: history
 with tab2:
@@ -659,3 +802,83 @@ with tab5:
                 file_name=f"treeningkava_{goal.event_name.replace(' ', '_')}_{goal.event_date.isoformat()}.csv",
                 mime="text/csv",
             )
+
+# --- Tab 6: daily usage log history (Project Plan §4.3)
+with tab6:
+    st.markdown(
+        "Päeva-päeva log: iga päeva, mil sa tööriista kasutad, hindad soovitust 1–5 "
+        "skaalal ning märgid, kas järgisid ja kuidas järgmine treening läks. Andmed "
+        "lähevad valideerimise §4.3 (isiklik igapäevane kasutus) analüüsi."
+    )
+
+    log_store = _get_store()
+    logs = log_store.list_daily_logs()
+    if not logs:
+        st.info(
+            "Päeva-logisid pole veel. Mine **Tänane soovitus**-tabi, vajuta "
+            "_Hinda koormust_ ja täida päeva-logi vorm."
+        )
+    else:
+        followed_map = {"yes": "Jah", "partial": "Osaliselt", "no": "Ei", None: "—"}
+        rows = [
+            {
+                "Kuupäev": e.log_date.isoformat(),
+                "Soovitus": e.recommended_category,
+                "Kasulikkus": e.usefulness if e.usefulness else "—",
+                "Veenvus": e.persuasiveness if e.persuasiveness else "—",
+                "Järgisin": followed_map.get(e.followed, "—"),
+                "Järgmise treeningu tunne": e.next_session_feeling if e.next_session_feeling else "—",
+                "Märkmed": (e.notes or "")[:80],
+            }
+            for e in logs
+        ]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+        st.markdown("#### Koondnäitajad")
+        col1, col2, col3, col4 = st.columns(4)
+        with_useful = [e.usefulness for e in logs if e.usefulness]
+        with_pers = [e.persuasiveness for e in logs if e.persuasiveness]
+        followed_yes = sum(1 for e in logs if e.followed == "yes")
+        feel = [e.next_session_feeling for e in logs if e.next_session_feeling]
+        col1.metric(
+            "Päevi logitud", len(logs),
+            help="Iga päev = üks sissekanne. Eesmärk §4.3: 14 päeva järjest.",
+        )
+        col2.metric(
+            "Keskmine kasulikkus",
+            f"{sum(with_useful) / len(with_useful):.1f}" if with_useful else "—",
+        )
+        col3.metric(
+            "Keskmine veenvus",
+            f"{sum(with_pers) / len(with_pers):.1f}" if with_pers else "—",
+        )
+        col4.metric(
+            "Järgisid soovitust",
+            f"{followed_yes}/{len(logs)}",
+            help="Mitu päeva valisid 'Jah' (mitte 'Osaliselt' ega 'Ei').",
+        )
+        if feel:
+            st.caption(
+                f"Järgmise treeningu enesetunde keskmine: **{sum(feel) / len(feel):.1f}/5** "
+                f"(n={len(feel)} päeva)"
+            )
+
+        # Convenience: CSV download for the project report
+        csv_bytes = pd.DataFrame([
+            {
+                "log_date": e.log_date.isoformat(),
+                "recommended_category": e.recommended_category,
+                "usefulness": e.usefulness,
+                "persuasiveness": e.persuasiveness,
+                "followed": e.followed,
+                "next_session_feeling": e.next_session_feeling,
+                "notes": e.notes or "",
+                "rationale_excerpt": e.rationale_excerpt or "",
+            } for e in logs
+        ]).to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "📥 Lae logi CSV-na",
+            data=csv_bytes,
+            file_name=f"vorm_daily_log_{date.today().isoformat()}.csv",
+            mime="text/csv",
+        )

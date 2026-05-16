@@ -36,6 +36,60 @@ Sinu roll on sel juhul *põhjendada* reegli rakendumist ja anda konkreetne asend
 "Jätka plaanipäraselt", "Vähenda intensiivsust", "Lisa taastumispäev", "Alternatiivne treening".
 """
 
+# ---------------------------------------------------------------------------
+# Prompt-variant katalog — projekti plaan §3 hilisem: "promptide süstemaatiline
+# A/B-testimine". Iga variant tasub testida sama valideerimisanded peal
+# (`scripts/validate.py --llm --prompt-variant <võti>`).
+#
+# Variantide ühisosa:
+#   - keel = eesti
+#   - JSON-skeem on sama
+#   - 4 kategooriat on samad
+# Variantide erinevus on rõhuasetus (numbritel / konservatiivsusel / kogemustel).
+# ---------------------------------------------------------------------------
+
+_VARIANT_NUMERIC = """Oled kesk- ja pikamaajooksjatele spetsialiseerunud spordifüsioloogia nõustaja. \
+Sinu erialane stiil on **arvupõhine**: iga soovitus toetub konkreetsetele
+mõõdetud näitajatele (ACWR, TRIMP, monotoonsus, RPE-trend).
+
+Põhimõtted:
+- Vasta alati eesti keeles.
+- Vasta struktureeritud JSON-is, mis järgib etteantud skeemi.
+- Kui süsteem on märkinud ohutusreegli (safety_flag) — JÄRGI seda, põhjenda.
+- Põhjenduses peab olema **vähemalt 3 konkreetset arvu** (näiteks ACWR 1.34,
+  RPE eile 8, uni 6.2 h). Ära kasuta umbmääraseid fraase nagu "kõrge koormus" —
+  ütle alati, kui kõrge.
+- Põhjendus on 2–4 lauset.
+- Ära anna meditsiinilist nõu.
+- Kategooria peab olema täpselt üks neljast: "Jätka plaanipäraselt",
+  "Vähenda intensiivsust", "Lisa taastumispäev", "Alternatiivne treening".
+"""
+
+_VARIANT_CONSERVATIVE = """Oled kesk- ja pikamaajooksjatele spetsialiseerunud spordifüsioloogia nõustaja, \
+kelle stiil on **konservatiivne** — kahtluse korral eelistad ettevaatust.
+
+Põhimõtted:
+- Vasta alati eesti keeles, struktureeritud JSON-is.
+- Kui süsteem on märkinud ohutusreegli — JÄRGI seda.
+- Kui ACWR ≥ 1.3 või uni < 6.5 h või eilne RPE ≥ 8, kaalu ettevaatlikku
+  kategooriat (Vähenda / Taastumine), isegi kui ohutusreegel täpselt ei fire-nud.
+  Põhjenda, miks signaal on piisav.
+- Põhjendus on 2–4 lauset eesti keeles, viidates konkreetsetele arvudele.
+- Ära anna meditsiinilist nõu.
+- Kategooria peab olema täpselt üks neljast.
+"""
+
+PROMPT_VARIANTS: dict[str, str] = {
+    "baseline": SYSTEM_PROMPT,
+    "numeric": _VARIANT_NUMERIC,
+    "conservative": _VARIANT_CONSERVATIVE,
+}
+
+
+def select_system_prompt(variant: str) -> str:
+    """Pick a system prompt by variant key. Falls back to baseline if unknown."""
+    return PROMPT_VARIANTS.get(variant, SYSTEM_PROMPT)
+
 RESPONSE_SCHEMA = {
     "type": "object",
     "required": ["category", "rationale", "confidence"],
@@ -122,6 +176,7 @@ def build_prompt(
     today_plan: str,
     subjective: DailySubjective | None,
     today: date | None = None,
+    variant: str = "baseline",
 ) -> PromptBundle:
     today = today or date.today()
     user_prompt = _compose_user_prompt(
@@ -133,7 +188,9 @@ def build_prompt(
         subjective=subjective,
         today=today,
     )
-    return PromptBundle(system=SYSTEM_PROMPT, user=user_prompt, schema=RESPONSE_SCHEMA)
+    system = select_system_prompt(variant)
+    version = f"{PROMPT_VERSION}-{variant}" if variant != "baseline" else PROMPT_VERSION
+    return PromptBundle(system=system, user=user_prompt, schema=RESPONSE_SCHEMA, version=version)
 
 
 def _compose_user_prompt(

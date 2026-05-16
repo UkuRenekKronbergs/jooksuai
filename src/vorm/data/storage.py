@@ -9,10 +9,26 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterable
-from datetime import date
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .models import AthleteProfile, TrainingActivity
+
+
+@dataclass(frozen=True)
+class DailyLogEntry:
+    """One day's record for Project Plan §4.3 daily-usage tracking."""
+
+    log_date: date
+    recommended_category: str
+    rationale_excerpt: str | None = None
+    usefulness: int | None = None  # 1-5
+    persuasiveness: int | None = None  # 1-5
+    followed: str | None = None  # 'yes' | 'no' | 'partial'
+    next_session_feeling: int | None = None  # 1-5
+    notes: str | None = None
+    created_at: datetime | None = None
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS training_activities (
@@ -35,6 +51,21 @@ CREATE INDEX IF NOT EXISTS idx_activities_date
 CREATE TABLE IF NOT EXISTS athlete_profile (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     payload     TEXT NOT NULL
+);
+
+-- Daily usage log — feeds Project Plan §4.3 "Isiklik igapäevane kasutus".
+-- One row per day the athlete used the tool. `usefulness`, `persuasiveness`,
+-- `followed` are 1–5 / yes/no/partial scales.
+CREATE TABLE IF NOT EXISTS daily_log (
+    log_date              TEXT PRIMARY KEY,
+    recommended_category  TEXT NOT NULL,
+    rationale_excerpt     TEXT,
+    usefulness            INTEGER,   -- 1-5
+    persuasiveness        INTEGER,   -- 1-5
+    followed              TEXT,      -- 'yes' | 'no' | 'partial'
+    next_session_feeling  INTEGER,   -- 1-5 subjective how the next session went
+    notes                 TEXT,
+    created_at            TEXT NOT NULL
 );
 """
 
@@ -156,6 +187,95 @@ class ActivityStore:
             return None
         data = json.loads(row["payload"])
         return AthleteProfile(**data)
+
+    # --- Daily usage log (Project Plan §4.3) ------------------------------
+
+    def save_daily_log(self, entry: DailyLogEntry) -> None:
+        """Upsert one day's log row. Re-saving the same `log_date` replaces it."""
+        followed = entry.followed
+        if followed not in (None, "yes", "no", "partial"):
+            raise ValueError(f"followed must be yes/no/partial/None, got {followed!r}")
+        for field_name, value in (
+            ("usefulness", entry.usefulness),
+            ("persuasiveness", entry.persuasiveness),
+            ("next_session_feeling", entry.next_session_feeling),
+        ):
+            if value is not None and not (1 <= value <= 5):
+                raise ValueError(f"{field_name} must be in 1..5 or None, got {value!r}")
+        created = (entry.created_at or datetime.now(timezone.utc)).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO daily_log (
+                    log_date, recommended_category, rationale_excerpt,
+                    usefulness, persuasiveness, followed,
+                    next_session_feeling, notes, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(log_date) DO UPDATE SET
+                    recommended_category = excluded.recommended_category,
+                    rationale_excerpt    = excluded.rationale_excerpt,
+                    usefulness           = excluded.usefulness,
+                    persuasiveness       = excluded.persuasiveness,
+                    followed             = excluded.followed,
+                    next_session_feeling = excluded.next_session_feeling,
+                    notes                = excluded.notes,
+                    created_at           = excluded.created_at
+                """,
+                (
+                    entry.log_date.isoformat(),
+                    entry.recommended_category,
+                    entry.rationale_excerpt,
+                    entry.usefulness,
+                    entry.persuasiveness,
+                    followed,
+                    entry.next_session_feeling,
+                    entry.notes,
+                    created,
+                ),
+            )
+
+    def list_daily_logs(
+        self, since: date | None = None, until: date | None = None
+    ) -> list[DailyLogEntry]:
+        query = "SELECT * FROM daily_log WHERE 1=1"
+        params: list = []
+        if since:
+            query += " AND log_date >= ?"
+            params.append(since.isoformat())
+        if until:
+            query += " AND log_date <= ?"
+            params.append(until.isoformat())
+        query += " ORDER BY log_date ASC"
+        with self._conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [_row_to_daily_log(r) for r in rows]
+
+    def get_daily_log(self, day: date) -> DailyLogEntry | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM daily_log WHERE log_date = ?", (day.isoformat(),)
+            ).fetchone()
+        return _row_to_daily_log(row) if row else None
+
+
+def _row_to_daily_log(row: sqlite3.Row) -> DailyLogEntry:
+    created_at = None
+    if row["created_at"]:
+        try:
+            created_at = datetime.fromisoformat(row["created_at"])
+        except ValueError:
+            created_at = None
+    return DailyLogEntry(
+        log_date=date.fromisoformat(row["log_date"]),
+        recommended_category=row["recommended_category"],
+        rationale_excerpt=row["rationale_excerpt"],
+        usefulness=row["usefulness"],
+        persuasiveness=row["persuasiveness"],
+        followed=row["followed"],
+        next_session_feeling=row["next_session_feeling"],
+        notes=row["notes"],
+        created_at=created_at,
+    )
 
 
 def _row_to_activity(row: sqlite3.Row) -> TrainingActivity:
