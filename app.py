@@ -520,6 +520,12 @@ _autosave_profile(profile)
 # ACWR=0/TRIMP=0 because the 7-day window is empty.
 activities = _get_activities(source, uploaded_csv, days, cfg, use_demo_data=use_demo_data)
 latest_activity_date = max((a.activity_date for a in activities), default=None)
+data_context_key = (
+    source,
+    bool(use_demo_data),
+    len(activities),
+    latest_activity_date.isoformat() if latest_activity_date else None,
+)
 
 # Reset the widget's session_state when (a) it has never been set, or (b) the
 # stored choice is now past the loaded dataset — the latter handles the case
@@ -570,13 +576,14 @@ if not activities:
     if source == _SOURCE_MANUAL:
         st.info(
             "Käsitsi lisamine alustab tühjalt. Lae vasakult CSV, ühenda andmeallikas "
-            "või vajuta **Täida demoandmetega**, et näidist kohe proovida."
+            "või vajuta **Täida demoandmetega**, et näidist kohe proovida. "
+            "Tänase plaani ja treeningkava kohta saad LLM-ilt küsida ka ilma ajaloofailita."
         )
     else:
         st.info("Andmed pole veel laaditud. Kontrolli vasakul valitud andmeallikat või lae CSV.")
-    st.stop()
+        st.stop()
 
-if analysis_date > latest_activity_date:
+if latest_activity_date and analysis_date > latest_activity_date:
     gap_days = (analysis_date - latest_activity_date).days
     st.warning(
         f"Valitud kuupäev on {gap_days} päeva pärast viimast trenni "
@@ -595,6 +602,12 @@ with tab1:
 
     summary = summarize_load(activities, profile, as_of=analysis_date)
 
+    if not activities:
+        st.info(
+            "Treeningajalugu puudub, seega ACWR/TRIMP numbrid on tühjad. "
+            "LLM kasutab sinu profiili, tänast plaani ja subjektiivseid sisendeid."
+        )
+
     col_metrics = st.columns(4)
     col_metrics[0].metric(
         "ACWR",
@@ -610,7 +623,7 @@ with tab1:
     )
 
     hr_coverage = sum(1 for a in activities if a.avg_hr) / max(len(activities), 1)
-    if hr_coverage < 0.5:
+    if activities and hr_coverage < 0.5:
         threshold = profile.effective_threshold_pace
         if threshold:
             st.info(
@@ -700,13 +713,18 @@ with tab1:
         # runs — daily logs silently never persist.
         st.session_state["last_evaluation"] = {
             "analysis_date": analysis_date,
+            "data_context_key": data_context_key,
             "verdict": verdict,
             "llm_result": llm_result,
             "prompt_text": prompt_bundle.user,
         }
 
     eval_state = st.session_state.get("last_evaluation")
-    if eval_state and eval_state.get("analysis_date") == analysis_date:
+    if (
+        eval_state
+        and eval_state.get("analysis_date") == analysis_date
+        and eval_state.get("data_context_key") == data_context_key
+    ):
         _render_verdict_box(eval_state["verdict"], eval_state["llm_result"])
 
         with st.expander("Näita LLM-i kasutatud prompti (diagnostika)"):
@@ -730,6 +748,8 @@ with tab1:
 # --- Tab 2: history
 with tab2:
     daily = build_load_timeseries(activities, profile, end=analysis_date)
+    if not activities:
+        st.info("Koormuse ajalugu ilmub siia siis, kui lisad CSV/andmeallika või käivitad demoandmed.")
     col1, col2 = st.columns(2)
     with col1:
         st.plotly_chart(acwr_chart(daily), width="stretch")
@@ -751,7 +771,11 @@ with tab2:
     st.plotly_chart(fitness_form_chart(daily), width="stretch")
 
     st.markdown("#### Viimase 14 päeva kokkuvõte")
-    st.dataframe(_summary_table(activities, analysis_date), width="stretch", hide_index=True)
+    recent_summary = _summary_table(activities, analysis_date)
+    if recent_summary.empty:
+        st.info("Viimase 14 päeva treeninguid pole.")
+    else:
+        st.dataframe(recent_summary, width="stretch", hide_index=True)
 
 # --- Tab 3: personal bests
 with tab3:
@@ -798,11 +822,14 @@ with tab4:
         "(10 varasemat päeva) — võrdle oma tegeliku otsusega."
     )
 
-    earliest = min(a.activity_date for a in activities)
-    latest = max(a.activity_date for a in activities)
-    if latest <= earliest + timedelta(days=30):
-        st.warning("Liiga lühike andmeloend retrospektiivseks testiks (vaja ≥ 30 päeva).")
+    if not activities:
+        st.info("Retrospektiivne test vajab treeningajalugu. Tänase plaani jaoks kasuta esimest tabi.")
     else:
+        earliest = min(a.activity_date for a in activities)
+        latest = max(a.activity_date for a in activities)
+    if activities and latest <= earliest + timedelta(days=30):
+        st.warning("Liiga lühike andmeloend retrospektiivseks testiks (vaja ≥ 30 päeva).")
+    elif activities:
         retro_date = st.date_input(
             "Retrospektiivne kuupäev",
             value=latest - timedelta(days=7),
