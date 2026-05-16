@@ -11,9 +11,54 @@ def _registry():
     return {"lock": RLock(), "sessions": {}}
 
 
+def test_browser_session_key_uses_vorm_cookie(monkeypatch):
+    cookie_value = "vorm-session-cookie-abcdefghijklmnopqrstuvwxyz"
+    monkeypatch.setattr(auth, "_read_browser_session_cookie", lambda: cookie_value)
+    monkeypatch.setattr(auth.st, "session_state", {})
+
+    assert auth._browser_session_key() == cookie_value
+    assert auth.st.session_state[auth._COOKIE_SESSION_KEY] == cookie_value
+
+
+def test_sync_browser_session_cookie_creates_opaque_cookie(monkeypatch):
+    rendered = []
+    generated = "generated-session-abcdefghijklmnopqrstuvwxyz"
+    monkeypatch.setattr(auth, "_read_browser_session_cookie", lambda: None)
+    monkeypatch.setattr(auth.secrets, "token_urlsafe", lambda length: generated)
+    monkeypatch.setattr(
+        auth,
+        "_render_cookie_script",
+        lambda session_id=None, *, delete=False: rendered.append((session_id, delete)),
+    )
+    monkeypatch.setattr(auth.st, "session_state", {})
+
+    auth._sync_browser_session_cookie()
+
+    assert auth.st.session_state[auth._COOKIE_SESSION_KEY] == generated
+    assert rendered == [(generated, False)]
+
+
+def test_forget_persistent_session_schedules_cookie_delete(monkeypatch):
+    registry = _registry()
+    registry["sessions"]["browser-1"] = auth._PersistedSession(
+        kind="guest",
+        user=None,
+        updated_at=time.time(),
+    )
+    monkeypatch.setattr(auth, "_browser_session_key", lambda: "browser-1")
+    monkeypatch.setattr(auth, "_persistent_sessions", lambda: registry)
+    monkeypatch.setattr(auth.st, "session_state", {})
+
+    auth._forget_persistent_session()
+
+    assert registry["sessions"] == {}
+    assert auth.st.session_state[auth._COOKIE_DELETE_PENDING_KEY] is True
+
+
 def test_restore_persistent_guest(monkeypatch):
     registry = _registry()
     monkeypatch.setattr(auth, "_browser_session_key", lambda: "browser-1")
+    monkeypatch.setattr(auth, "_render_cookie_script", lambda *args, **kwargs: None)
     monkeypatch.setattr(auth, "_persistent_sessions", lambda: registry)
     monkeypatch.setattr(auth.st, "session_state", {})
 
@@ -50,6 +95,7 @@ def test_restore_persistent_user_refreshes_supabase_session(monkeypatch):
 
     fake_client = SimpleNamespace(auth=FakeAuth())
     monkeypatch.setattr(auth, "_browser_session_key", lambda: "browser-1")
+    monkeypatch.setattr(auth, "_render_cookie_script", lambda *args, **kwargs: None)
     monkeypatch.setattr(auth, "_persistent_sessions", lambda: registry)
     monkeypatch.setattr(auth, "_get_client", lambda: fake_client)
     monkeypatch.setattr(auth.st, "session_state", {})

@@ -9,15 +9,18 @@ Flow:
 3. **Forgot password** → user requests a recovery email, opens the Supabase
    link, and sets a new password inside this Streamlit app.
 
-The in-memory session registry is keyed by Streamlit's browser cookies, so a
+The in-memory session registry is keyed by our own opaque browser cookie, so a
 plain browser refresh restores the user without showing the login gate again.
-It is intentionally process-local: a server restart or redeploy still requires
-signing in again.
+Only a random session id is stored in the cookie; Supabase tokens stay
+server-side. The registry is intentionally process-local: a server restart or
+redeploy still requires signing in again.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
+import secrets
 import time
 from dataclasses import dataclass
 from threading import RLock
@@ -48,6 +51,9 @@ _PENDING_CONFIRM_KEY = "_vorm_auth_pending_confirm_email"
 _PASSWORD_RECOVERY_KEY = "_vorm_password_recovery_active"
 _PASSWORD_RESET_DONE_KEY = "_vorm_password_reset_done"
 _GUEST_KEY = "_vorm_guest_mode"
+_COOKIE_SESSION_KEY = "_vorm_browser_session_id"
+_COOKIE_DELETE_PENDING_KEY = "_vorm_browser_session_delete_pending"
+_COOKIE_NAME = "vorm_session"
 _PASSWORD_RESET_FLOW = "password_reset"
 _AUTH_QUERY_KEYS = (
     "access_token",
@@ -64,6 +70,7 @@ _AUTH_QUERY_KEYS = (
     "type",
 )
 _PERSIST_TTL_SECONDS = 60 * 60 * 24 * 14
+_COOKIE_MAX_AGE_SECONDS = _PERSIST_TTL_SECONDS
 
 
 @dataclass(frozen=True)
@@ -79,18 +86,99 @@ def _persistent_sessions() -> dict:
     return {"lock": RLock(), "sessions": {}}
 
 
+def _is_valid_session_id(value: str | None) -> bool:
+    if not value or not (24 <= len(value) <= 128):
+        return False
+    return all(ch.isalnum() or ch in "-_" for ch in value)
+
+
+def _read_browser_session_cookie() -> str | None:
+    try:
+        value = st.context.cookies.to_dict().get(_COOKIE_NAME)
+    except Exception:
+        return None
+    return value if _is_valid_session_id(value) else None
+
+
+def _render_cookie_script(session_id: str | None = None, *, delete: bool = False) -> None:
+    """Write/delete our opaque browser cookie from the browser side.
+
+    Streamlit exposes cookies as read-only in Python, so the tiny component is
+    only a bridge for cookie mutation. The cookie value is not a JWT or refresh
+    token; it is a random lookup key into the process-local registry below.
+    """
+    cookie_name = json.dumps(_COOKIE_NAME)
+    cookie_value = json.dumps(session_id or "")
+    max_age = int(_COOKIE_MAX_AGE_SECONDS)
+    delete_flag = "true" if delete else "false"
+    components.html(
+        f"""
+<script>
+(() => {{
+  const name = {cookie_name};
+  const value = {cookie_value};
+  const shouldDelete = {delete_flag};
+  const maxAge = {max_age};
+  const secure = window.parent.location.protocol === "https:" ? "; Secure" : "";
+  const attrs = `; path=/; SameSite=Lax${{secure}}`;
+  const cookie = shouldDelete
+    ? `${{name}}=; Max-Age=0${{attrs}}`
+    : `${{name}}=${{encodeURIComponent(value)}}; Max-Age=${{maxAge}}${{attrs}}`;
+  try {{
+    window.parent.document.cookie = cookie;
+  }} catch (_) {{
+    document.cookie = cookie;
+  }}
+}})();
+</script>
+        """,
+        height=0,
+    )
+
+
+def _sync_browser_session_cookie() -> None:
+    if st.session_state.pop(_COOKIE_DELETE_PENDING_KEY, False):
+        _render_cookie_script(delete=True)
+        st.session_state.pop(_COOKIE_SESSION_KEY, None)
+        return
+
+    cookie_value = _read_browser_session_cookie()
+    if cookie_value:
+        st.session_state[_COOKIE_SESSION_KEY] = cookie_value
+        return
+
+    state_value = st.session_state.get(_COOKIE_SESSION_KEY)
+    if _is_valid_session_id(state_value):
+        _render_cookie_script(state_value)
+        return
+
+    session_id = secrets.token_urlsafe(32)
+    st.session_state[_COOKIE_SESSION_KEY] = session_id
+    _render_cookie_script(session_id)
+
+
 def _browser_session_key() -> str | None:
-    """Stable-ish per-browser key from Streamlit's own cookies.
+    """Stable per-browser key from our own opaque cookie.
 
     We store Supabase tokens server-side rather than in a JS-readable cookie.
-    If Streamlit cannot expose a cookie (tests / unusual embedded contexts),
-    persistence simply degrades to the old session_state-only behaviour.
+    During the first render the cookie may not be visible to Python yet, so we
+    use the freshly-generated value from ``st.session_state`` as the same key.
     """
+    cookie_value = _read_browser_session_cookie()
+    if cookie_value:
+        st.session_state[_COOKIE_SESSION_KEY] = cookie_value
+        return cookie_value
+
+    state_value = st.session_state.get(_COOKIE_SESSION_KEY)
+    if _is_valid_session_id(state_value):
+        return state_value
+
+    # Backward-compatible fallback for sessions remembered before `vorm_session`
+    # existed. New sessions should use the explicit cookie above.
     try:
         cookies = st.context.cookies.to_dict()
     except Exception:
         return None
-
     for cookie_name in (
         "_streamlit_xsrf",
         "_streamlit_session",
@@ -115,6 +203,9 @@ def _remember_persistent_session(kind: str, user: AuthUser | None = None) -> Non
     key = _browser_session_key()
     if not key:
         return
+    st.session_state.pop(_COOKIE_DELETE_PENDING_KEY, None)
+    if _is_valid_session_id(key):
+        _render_cookie_script(key)
     registry = _persistent_sessions()
     with registry["lock"]:
         sessions = registry["sessions"]
@@ -125,10 +216,12 @@ def _remember_persistent_session(kind: str, user: AuthUser | None = None) -> Non
 def _forget_persistent_session() -> None:
     key = _browser_session_key()
     if not key:
+        st.session_state[_COOKIE_DELETE_PENDING_KEY] = True
         return
     registry = _persistent_sessions()
     with registry["lock"]:
         registry["sessions"].pop(key, None)
+    st.session_state[_COOKIE_DELETE_PENDING_KEY] = True
 
 
 def _load_persistent_session() -> _PersistedSession | None:
@@ -623,6 +716,7 @@ def render_login_gate() -> AuthUser | None:
     ``is_guest()`` is False, the caller should ``st.stop()`` — nothing else
     should render until the user either signs in or picks guest mode.
     """
+    _sync_browser_session_cookie()
     _surface_auth_hash_params()
     _consume_password_recovery_from_url()
     if st.session_state.get(_PASSWORD_RECOVERY_KEY):

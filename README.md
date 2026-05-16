@@ -237,7 +237,7 @@ Vaikimisi käivitub rakendus **anonüümses ühe-kasutaja režiimis** lokaalse S
 
 - **Sisselogimine** email + parooliga. Esmakordsel registreerumisel saadab Supabase kinnitusmaili — pärast lingile klikkimist pole kinnitamist enam vaja, ainult email + parool.
 - **Parooli taastamine** on login-väravas eraldi tabina olemas. Kasutaja saab taastamislingi emailile, avab lingi ja määrab uue parooli samas Streamlit rakenduses.
-- **Brauseri refresh ei logi välja.** Rakendus mäletab sisselogitud kasutajat serveriprotsessi sees Streamliti brauseri-cookie sõrmejälje järgi ja taastab Supabase sessiooni refresh-tokeniga. Serveri restart/redeploy nõuab uuesti sisselogimist.
+- **Brauseri refresh ei logi välja.** Rakendus paneb brauserisse oma `vorm_session` cookie, kus on ainult juhuslik sessiooni-ID; Supabase tokenid jäävad serveripoole registrisse ja sessioon taastatakse refresh-tokeniga. Serveri restart/redeploy nõuab uuesti sisselogimist.
 - **Sportlase profiil**, **päevalogi** ja **Strava ühendus** salvestuvad pilve — säilivad redeploy'de vahel, näha igast seadmest. Profiil **salvestub automaatselt** kui väärtusi muudad.
 - **Row-Level Security** — iga kasutaja näeb ainult enda andmeid; PostgreSQL võtab vastutuse, mitte rakenduse-kood.
 - **Strava-vahemälu** jääb endiselt lokaalseks SQLite'iks, aga cache-fail on kasutaja/ühenduse järgi eristatud.
