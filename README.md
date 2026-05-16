@@ -177,6 +177,49 @@ Väljundid:
 - `validation_data.csv` — per-day võrdlustabel.
 - `validation_llm_cache.json` — ainult `--llm` režiimis; LLM-vastused (cache-võti = sisendi hash + mudel + prompti versioon, automaatne invalideerimine).
 
+## Tasuta deploy — Streamlit Community Cloud
+
+Rakendus on cloud-deploy-valmis. Failisüsteemil ei pea olema kirjeldatud sõltuvusi peale `requirements.txt`-i; saladused tulevad Streamlit Cloud'i settings'ist.
+
+### Sammud
+
+1. **Logi sisse** [share.streamlit.io](https://share.streamlit.io) GitHubi kaudu.
+2. **Deploy app** → repo: `UkuRenekKronbergs/vorm`, branch: `main`, main file: `app.py`.
+3. **Advanced settings → Python version:** vali `3.13` (matches [`runtime.txt`](runtime.txt)).
+4. **App settings → Secrets** — kleebi TOML-vormingus (näide OpenRouteri + DeepSeek-iga):
+   ```toml
+   LLM_PROVIDER = "openrouter"
+   LLM_MODEL = "deepseek/deepseek-v4-flash"
+   LLM_TEMPERATURE = "0"
+   OPENROUTER_API_KEY = "sk-or-v1-..."
+   # Anthropic / OpenAI variandid:
+   # ANTHROPIC_API_KEY = "sk-ant-..."
+   # OPENAI_API_KEY    = "sk-..."
+   # Strava (valikuline — ilma selleta peita "Strava API" valik UI-st):
+   # STRAVA_CLIENT_ID     = "12345"
+   # STRAVA_CLIENT_SECRET = "..."
+   # STRAVA_REFRESH_TOKEN = "..."  # genereeri lokaalselt: python scripts/strava_bootstrap.py
+   ```
+5. Saad URL-i kujul `https://vorm-ai.streamlit.app`.
+
+Cloud-režiimis vaikimisi andmeallikas on **Näidisandmed** — täielik demo töötab ilma isikuandmeteta.
+
+### Cloud-spetsiifika
+
+- **Failisüsteem on efemeerne.** SQLite vahemälu (`data/cache/activities.sqlite`) ja päeva-logi kaovad iga restardi peal. Ühe-kasutaja demo jaoks pole probleem; mitme-kasutaja kasutuseks asenda `ActivityStore` Supabase'i / Turso / Neon'i peale (~2-3 h töö).
+- **App magab 7 päeva idle järel.** Esmase päringu cold-start ~30 s.
+- **Strava OAuth** — `scripts/strava_bootstrap.py` kasutab localhost:8000-i ega tööta cloud'is. Genereeri token lokaalselt, kleebi `STRAVA_REFRESH_TOKEN` Streamlit secrets'i.
+- **RAM ~1 GB.** Praegune sõltuvuste komplekt (Streamlit + pandas + scikit-learn) mahub ära ~400 MB peal.
+
+### Konfiguratsiooni resolutsioon
+
+`vorm.config.load_config()` otsib iga võtit kahest kohast (esimese leitu võidab):
+
+1. Process environment / `.env`-fail (lokaalne arendus, `python-dotenv` laeb)
+2. `streamlit.secrets` (Streamlit Cloud)
+
+Sama kood töötab mõlemas keskkonnas.
+
 ## Privaatsus
 
 - Treeningandmed (GPS-punktid, tooraine pulsiribaread) **ei** liigu LLM-pakkuja serverisse — LLM näeb ainult agregeeritud näitajaid ja metaandmeid.

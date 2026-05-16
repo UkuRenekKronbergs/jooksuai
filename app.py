@@ -360,7 +360,14 @@ data_source_options = ["Näidisandmed", "CSV-fail", "Garmin GPX-kaust"]
 if cfg.has_strava:
     data_source_options.insert(2, "Strava API")  # Strava enne Garmin-fallback'it
 
-source = st.sidebar.radio("Andmeallikas", data_source_options)
+# index=0 → "Näidisandmed" on cloud-demo-sõbralik default; ükski tegelik isiku-
+# andmestik pole vajalik, et UI demoks ette valmistada.
+source = st.sidebar.radio(
+    "Andmeallikas",
+    data_source_options,
+    index=0,
+    help="Cloud-demo: alusta 'Näidisandmed'-iga. Oma andmete jaoks vajad lokaalset käivitust + .env-faili.",
+)
 days = st.sidebar.slider("Päevade arv", min_value=28, max_value=180, value=90, step=7)
 
 uploaded_csv = None

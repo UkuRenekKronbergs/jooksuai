@@ -1,7 +1,12 @@
 """Environment-based configuration.
 
-Reads from .env if present; all values are optional so the app runs in
-sample-data mode even without any credentials.
+Resolution order for every key:
+1. Process environment / `.env` (via python-dotenv) — local-dev path.
+2. `streamlit.secrets` — populated from Streamlit Community Cloud's
+   *App settings → Secrets* TOML editor.
+
+All values are optional so the app runs in sample-data mode even without
+any credentials.
 """
 
 from __future__ import annotations
@@ -24,6 +29,37 @@ USER_DIR = DATA_DIR / "user"
 
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def _from_streamlit_secrets(key: str) -> str | None:
+    """Look up `key` in `st.secrets` if Streamlit is importable AND a
+    `secrets.toml` is configured. Returns None on any failure so CLI use
+    (`scripts/validate.py`) doesn't crash when Streamlit isn't running."""
+    try:
+        import streamlit as st  # noqa: PLC0415 — defer import; CLI path may not have streamlit installed
+    except ImportError:
+        return None
+    try:
+        secrets = st.secrets
+    except Exception:
+        # streamlit raises StreamlitSecretNotFoundError when no secrets.toml exists.
+        return None
+    try:
+        value = secrets[key]
+    except (KeyError, FileNotFoundError):
+        return None
+    return str(value) if value else None
+
+
+def _get(key: str, default: str | None = None) -> str | None:
+    """Env-first, Streamlit-secrets-fallback lookup."""
+    value = os.getenv(key)
+    if value:
+        return value
+    secret = _from_streamlit_secrets(key)
+    if secret:
+        return secret
+    return default
 
 
 @dataclass(frozen=True)
@@ -79,16 +115,16 @@ _DEFAULT_MODEL_BY_PROVIDER = {
 
 
 def load_config() -> Config:
-    provider = os.getenv("LLM_PROVIDER", "anthropic").lower()
+    provider = (_get("LLM_PROVIDER") or "anthropic").lower()
     default_model = _DEFAULT_MODEL_BY_PROVIDER.get(provider, "claude-sonnet-4-6")
     return Config(
-        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY") or None,
-        openai_api_key=os.getenv("OPENAI_API_KEY") or None,
-        openrouter_api_key=os.getenv("OPENROUTER_API_KEY") or None,
-        strava_client_id=os.getenv("STRAVA_CLIENT_ID") or None,
-        strava_client_secret=os.getenv("STRAVA_CLIENT_SECRET") or None,
-        strava_refresh_token=os.getenv("STRAVA_REFRESH_TOKEN") or None,
+        anthropic_api_key=_get("ANTHROPIC_API_KEY") or None,
+        openai_api_key=_get("OPENAI_API_KEY") or None,
+        openrouter_api_key=_get("OPENROUTER_API_KEY") or None,
+        strava_client_id=_get("STRAVA_CLIENT_ID") or None,
+        strava_client_secret=_get("STRAVA_CLIENT_SECRET") or None,
+        strava_refresh_token=_get("STRAVA_REFRESH_TOKEN") or None,
         llm_provider=provider,
-        llm_model=os.getenv("LLM_MODEL", default_model),
-        llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0")),
+        llm_model=_get("LLM_MODEL", default_model),
+        llm_temperature=float(_get("LLM_TEMPERATURE", "0") or "0"),
     )
