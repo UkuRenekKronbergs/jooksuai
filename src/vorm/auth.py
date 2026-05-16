@@ -5,23 +5,27 @@ Flow:
    link (requires *Confirm email* ON in Supabase Auth settings — the default).
    User clicks the link once → account is confirmed.
 2. **Sign in** → user enters email + password. Returns a Session that we cache
-   in ``st.session_state``.
+   in ``st.session_state`` and remember server-side for this browser.
+3. **Forgot password** → user requests a recovery email, opens the Supabase
+   link, and sets a new password inside this Streamlit app.
 
-The session lives as long as Streamlit keeps the tab's session_state. Browser
-refresh = re-login. For persistence across refreshes we'd add cookie storage
-(e.g. ``streamlit-extras``), which is out of scope for the validation phase.
-
-Password reset / forgot-password isn't wired into the UI yet — recover via
-the Supabase Dashboard (Authentication → Users → ⋯ → Send password recovery)
-if a user gets locked out.
+The in-memory session registry is keyed by Streamlit's browser cookies, so a
+plain browser refresh restores the user without showing the login gate again.
+It is intentionally process-local: a server restart or redeploy still requires
+signing in again.
 """
 
 from __future__ import annotations
 
+import hashlib
+import time
 from dataclasses import dataclass
+from threading import RLock
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from .config import load_config
 from .data.supabase_store import SupabaseNotConfigured, SupabaseStore
@@ -41,7 +45,190 @@ class AuthUser:
 _CLIENT_KEY = "_vorm_supabase_client"
 _USER_KEY = "_vorm_auth_user"
 _PENDING_CONFIRM_KEY = "_vorm_auth_pending_confirm_email"
+_PASSWORD_RECOVERY_KEY = "_vorm_password_recovery_active"
+_PASSWORD_RESET_DONE_KEY = "_vorm_password_reset_done"
 _GUEST_KEY = "_vorm_guest_mode"
+_PASSWORD_RESET_FLOW = "password_reset"
+_AUTH_QUERY_KEYS = (
+    "access_token",
+    "auth_flow",
+    "code",
+    "error",
+    "error_code",
+    "error_description",
+    "expires_at",
+    "expires_in",
+    "refresh_token",
+    "token_hash",
+    "token_type",
+    "type",
+)
+_PERSIST_TTL_SECONDS = 60 * 60 * 24 * 14
+
+
+@dataclass(frozen=True)
+class _PersistedSession:
+    kind: str  # "user" | "guest"
+    user: AuthUser | None
+    updated_at: float
+
+
+@st.cache_resource
+def _persistent_sessions() -> dict:
+    """Process-local auth registry shared across Streamlit reruns/sessions."""
+    return {"lock": RLock(), "sessions": {}}
+
+
+def _browser_session_key() -> str | None:
+    """Stable-ish per-browser key from Streamlit's own cookies.
+
+    We store Supabase tokens server-side rather than in a JS-readable cookie.
+    If Streamlit cannot expose a cookie (tests / unusual embedded contexts),
+    persistence simply degrades to the old session_state-only behaviour.
+    """
+    try:
+        cookies = st.context.cookies.to_dict()
+    except Exception:
+        return None
+
+    for cookie_name in (
+        "_streamlit_xsrf",
+        "_streamlit_session",
+        "_streamlit_user",
+        "_streamlit_user_tokens",
+    ):
+        value = cookies.get(cookie_name)
+        if value:
+            raw = f"{cookie_name}:{value}".encode()
+            return hashlib.sha256(raw).hexdigest()
+    return None
+
+
+def _prune_persistent_sessions(sessions: dict[str, _PersistedSession]) -> None:
+    cutoff = time.time() - _PERSIST_TTL_SECONDS
+    for key, value in list(sessions.items()):
+        if value.updated_at < cutoff:
+            sessions.pop(key, None)
+
+
+def _remember_persistent_session(kind: str, user: AuthUser | None = None) -> None:
+    key = _browser_session_key()
+    if not key:
+        return
+    registry = _persistent_sessions()
+    with registry["lock"]:
+        sessions = registry["sessions"]
+        _prune_persistent_sessions(sessions)
+        sessions[key] = _PersistedSession(kind=kind, user=user, updated_at=time.time())
+
+
+def _forget_persistent_session() -> None:
+    key = _browser_session_key()
+    if not key:
+        return
+    registry = _persistent_sessions()
+    with registry["lock"]:
+        registry["sessions"].pop(key, None)
+
+
+def _load_persistent_session() -> _PersistedSession | None:
+    key = _browser_session_key()
+    if not key:
+        return None
+    registry = _persistent_sessions()
+    with registry["lock"]:
+        sessions = registry["sessions"]
+        _prune_persistent_sessions(sessions)
+        return sessions.get(key)
+
+
+def _query_param(name: str) -> str | None:
+    try:
+        value = st.query_params.get(name)
+    except Exception:
+        return None
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if value is None:
+        return None
+    return str(value)
+
+
+def _clear_auth_query_params() -> None:
+    try:
+        remaining = dict(st.query_params)
+        for key in _AUTH_QUERY_KEYS:
+            remaining.pop(key, None)
+        st.query_params.clear()
+        for key, value in remaining.items():
+            st.query_params[key] = value
+    except Exception:
+        pass
+
+
+def _password_reset_redirect_url() -> str | None:
+    """Current Streamlit URL with a marker so recovery links are unambiguous."""
+    try:
+        raw_url = st.context.url
+    except Exception:
+        return None
+    if not raw_url:
+        return None
+
+    parts = urlsplit(str(raw_url))
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["auth_flow"] = _PASSWORD_RESET_FLOW
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+
+
+def _surface_auth_hash_params() -> None:
+    """Expose Supabase implicit-flow recovery fragments to Streamlit.
+
+    Streamlit's Python side cannot read URL fragments, but some Supabase
+    recovery links return tokens after ``#``. This tiny client-side bridge
+    converts only auth-related recovery fragments into query params, and the
+    Python code clears them as soon as it consumes the session.
+    """
+    components.html(
+        """
+<script>
+(() => {
+  try {
+    const parentUrl = new URL(window.parent.location.href);
+    if (!parentUrl.hash || parentUrl.hash.length <= 1) return;
+
+    const hashParams = new URLSearchParams(parentUrl.hash.slice(1));
+    const hasResetMarker = parentUrl.searchParams.get("auth_flow") === "password_reset";
+    const isRecovery =
+      hasResetMarker ||
+      parentUrl.searchParams.get("type") === "recovery" ||
+      hashParams.get("type") === "recovery";
+    if (!isRecovery) return;
+
+    const keys = [
+      "access_token",
+      "error",
+      "error_code",
+      "error_description",
+      "expires_at",
+      "expires_in",
+      "refresh_token",
+      "token_hash",
+      "token_type",
+      "type",
+    ];
+    parentUrl.searchParams.set("auth_flow", "password_reset");
+    for (const key of keys) {
+      if (hashParams.has(key)) parentUrl.searchParams.set(key, hashParams.get(key));
+    }
+    parentUrl.hash = "";
+    window.parent.location.replace(parentUrl.toString());
+  } catch (_) {}
+})();
+</script>
+        """,
+        height=0,
+    )
 
 
 def _build_client() -> Client:
@@ -95,10 +282,12 @@ def is_guest() -> bool:
 
 def enter_guest_mode() -> None:
     st.session_state[_GUEST_KEY] = True
+    _remember_persistent_session("guest")
 
 
 def exit_guest_mode() -> None:
     st.session_state.pop(_GUEST_KEY, None)
+    _forget_persistent_session()
 
 
 def _bind_session(client: Client, user: AuthUser) -> None:
@@ -113,6 +302,73 @@ def _bind_session(client: Client, user: AuthUser) -> None:
         client.auth.set_session(user.access_token, user.refresh_token)
     except Exception:
         pass
+
+
+def _user_from_auth_response(resp, *, fallback_email: str = "") -> AuthUser:
+    session = getattr(resp, "session", None)
+    user = getattr(resp, "user", None)
+    if not session or not user:
+        raise RuntimeError("Sisselogimise sessiooni ei õnnestunud taastada.")
+    return AuthUser(
+        id=user.id,
+        email=user.email or fallback_email,
+        access_token=session.access_token,
+        refresh_token=session.refresh_token,
+    )
+
+
+def _user_from_session(session, *, fallback_email: str = "") -> AuthUser:
+    user = getattr(session, "user", None)
+    if not session or not user:
+        raise RuntimeError("Sisselogimise sessiooni ei õnnestunud taastada.")
+    return AuthUser(
+        id=user.id,
+        email=user.email or fallback_email,
+        access_token=session.access_token,
+        refresh_token=session.refresh_token,
+    )
+
+
+def _store_current_user(user: AuthUser, *, remember: bool = True) -> None:
+    st.session_state.pop(_GUEST_KEY, None)
+    st.session_state[_USER_KEY] = user
+    if remember:
+        _remember_persistent_session("user", user)
+    else:
+        _forget_persistent_session()
+
+
+def _refresh_user_session(client: Client, user: AuthUser) -> AuthUser:
+    """Refresh Supabase tokens from the persisted refresh token."""
+    resp = client.auth.refresh_session(user.refresh_token)
+    return _user_from_auth_response(resp, fallback_email=user.email)
+
+
+def _restore_persistent_session() -> AuthUser | None:
+    """Restore auth after a browser refresh, if this browser was remembered."""
+    if current_user():
+        return current_user()
+    if is_guest():
+        return None
+
+    persisted = _load_persistent_session()
+    if persisted is None:
+        return None
+    if persisted.kind == "guest":
+        st.session_state[_GUEST_KEY] = True
+        return None
+    if persisted.kind != "user" or persisted.user is None:
+        _forget_persistent_session()
+        return None
+
+    client = _get_client()
+    try:
+        user = _refresh_user_session(client, persisted.user)
+    except Exception:
+        _forget_persistent_session()
+        return None
+    _store_current_user(user)
+    return user
 
 
 def sign_up(email: str, password: str) -> bool:
@@ -134,19 +390,103 @@ def sign_in(email: str, password: str) -> AuthUser:
     resp = client.auth.sign_in_with_password(
         {"email": email, "password": password}
     )
-    if not resp.session or not resp.user:
-        raise RuntimeError("Sisselogimine ebaõnnestus.")
-    user = AuthUser(
-        id=resp.user.id,
-        email=resp.user.email or email,
-        access_token=resp.session.access_token,
-        refresh_token=resp.session.refresh_token,
+    user = _user_from_auth_response(resp, fallback_email=email)
+    _store_current_user(user)
+    return user
+
+
+def request_password_reset(email: str) -> None:
+    """Send Supabase password recovery email for an existing account."""
+    client = _get_client()
+    redirect_url = _password_reset_redirect_url()
+    options = {"redirect_to": redirect_url} if redirect_url else None
+    client.auth.reset_password_for_email(email, options)
+
+
+def update_password(new_password: str) -> AuthUser:
+    """Update the password for the recovery session and keep the user signed in."""
+    user = current_user()
+    if not user:
+        raise RuntimeError("Parooli muutmise sessioon puudub. Ava taastamislink uuesti.")
+
+    client = _get_client()
+    _bind_session(client, user)
+    client.auth.update_user({"password": new_password})
+
+    updated_user = user
+    try:
+        session = client.auth.get_session()
+    except Exception:
+        session = None
+    if session:
+        updated_user = _user_from_session(session, fallback_email=user.email)
+
+    _store_current_user(updated_user)
+    return updated_user
+
+
+def _is_password_recovery_query() -> bool:
+    return (
+        _query_param("auth_flow") == _PASSWORD_RESET_FLOW
+        or _query_param("type") == "recovery"
     )
-    st.session_state[_USER_KEY] = user
+
+
+def _consume_password_recovery_from_url() -> AuthUser | None:
+    if not _is_password_recovery_query():
+        return None
+
+    error = _query_param("error_description") or _query_param("error")
+    if error:
+        st.error(_humanize_auth_error(RuntimeError(error)))
+        _clear_auth_query_params()
+        return None
+
+    code = _query_param("code")
+    token_hash = _query_param("token_hash")
+    access_token = _query_param("access_token")
+    refresh_token = _query_param("refresh_token")
+    if not any((code, token_hash, access_token and refresh_token)):
+        if (
+            _query_param("auth_flow") == _PASSWORD_RESET_FLOW
+            or _query_param("type") == "recovery"
+        ):
+            return None
+        st.error(
+            "Taastamislink ei sisaldanud kehtivat sessioonikoodi. "
+            "Küsi uus link ja proovi uuesti."
+        )
+        _clear_auth_query_params()
+        return None
+
+    try:
+        client = _get_client()
+        if access_token and refresh_token:
+            resp = client.auth.set_session(access_token, refresh_token)
+        elif token_hash:
+            resp = client.auth.verify_otp(
+                {"token_hash": token_hash, "type": "recovery"}
+            )
+        else:
+            resp = client.auth.exchange_code_for_session({"auth_code": code})
+        user = _user_from_auth_response(resp)
+    except SupabaseNotConfigured as exc:
+        st.error(str(exc))
+        return None
+    except Exception as exc:
+        st.error(_humanize_auth_error(exc))
+        _clear_auth_query_params()
+        return None
+
+    _store_current_user(user, remember=False)
+    st.session_state[_PASSWORD_RECOVERY_KEY] = True
+    st.session_state.pop(_PENDING_CONFIRM_KEY, None)
+    _clear_auth_query_params()
     return user
 
 
 def sign_out() -> None:
+    _forget_persistent_session()
     client = st.session_state.get(_CLIENT_KEY)
     if client is not None:
         try:
@@ -155,7 +495,13 @@ def sign_out() -> None:
             # Local-only sign-out is fine even if the remote call fails (e.g.
             # offline) — clearing session_state below is what matters here.
             pass
-    for key in (_USER_KEY, _PENDING_CONFIRM_KEY, _CLIENT_KEY):
+    for key in (
+        _USER_KEY,
+        _PENDING_CONFIRM_KEY,
+        _PASSWORD_RECOVERY_KEY,
+        _PASSWORD_RESET_DONE_KEY,
+        _CLIENT_KEY,
+    ):
         st.session_state.pop(key, None)
 
 
@@ -193,9 +539,81 @@ def _humanize_auth_error(exc: Exception) -> str:
         return "See email on juba registreeritud. Logi sisse 'Logi sisse' tabist."
     if "password" in msg and ("short" in msg or "weak" in msg or "6 char" in msg):
         return "Parool on liiga lühike — peab olema vähemalt 6 märki."
+    if "expired" in msg or "otp_expired" in msg or "invalid token" in msg:
+        return "Parooli taastamise link ei kehti enam. Küsi uus link ja proovi uuesti."
+    if "session" in msg and ("missing" in msg or "puudub" in msg):
+        return "Parooli muutmise sessioon puudub. Ava taastamislink uuesti."
     if "rate limit" in msg or "429" in msg:
         return "Liiga palju katseid. Oota minut ja proovi uuesti."
     return f"Tõrge: {exc}"
+
+
+def _render_password_recovery_form() -> AuthUser | None:
+    user = current_user()
+    st.title("🏃 Vorm.ai")
+    st.markdown("### 🔑 Määra uus parool")
+
+    if not user:
+        st.error("Parooli muutmise sessioon puudub. Ava taastamislink uuesti.")
+        if st.button(
+            "Tagasi sisselogimise juurde",
+            key="_vorm_recovery_back_to_login",
+            width="stretch",
+        ):
+            st.session_state.pop(_PASSWORD_RECOVERY_KEY, None)
+            st.rerun()
+        return None
+
+    st.info(
+        f"Taastad parooli kontole **{user.email}**. "
+        "Pärast salvestamist jääd sisse logituks."
+    )
+    with st.form("vorm_password_recovery_form"):
+        new_password = st.text_input(
+            "Uus parool",
+            type="password",
+            key="_vorm_recovery_password",
+            help="Vähemalt 6 märki.",
+        )
+        new_password_confirm = st.text_input(
+            "Korda uut parooli",
+            type="password",
+            key="_vorm_recovery_password_confirm",
+        )
+        submitted = st.form_submit_button(
+            "Salvesta uus parool", type="primary", width="stretch"
+        )
+        if submitted:
+            if not new_password:
+                st.error("Uus parool on kohustuslik.")
+                return None
+            if new_password != new_password_confirm:
+                st.error("Paroolid ei klapi.")
+                return None
+            if len(new_password) < 6:
+                st.error("Parool peab olema vähemalt 6 märki.")
+                return None
+            try:
+                update_password(new_password)
+            except SupabaseNotConfigured as exc:
+                st.error(str(exc))
+                return None
+            except Exception as exc:
+                st.error(_humanize_auth_error(exc))
+                return None
+            st.session_state.pop(_PASSWORD_RECOVERY_KEY, None)
+            st.session_state[_PASSWORD_RESET_DONE_KEY] = True
+            st.rerun()
+
+    if st.button(
+        "Katkesta ja logi välja",
+        key="_vorm_recovery_cancel",
+        width="stretch",
+    ):
+        sign_out()
+        st.rerun()
+
+    return None
 
 
 def render_login_gate() -> AuthUser | None:
@@ -205,8 +623,15 @@ def render_login_gate() -> AuthUser | None:
     ``is_guest()`` is False, the caller should ``st.stop()`` — nothing else
     should render until the user either signs in or picks guest mode.
     """
-    user = current_user()
+    _surface_auth_hash_params()
+    _consume_password_recovery_from_url()
+    if st.session_state.get(_PASSWORD_RECOVERY_KEY):
+        return _render_password_recovery_form()
+
+    user = _restore_persistent_session()
     if user:
+        if st.session_state.pop(_PASSWORD_RESET_DONE_KEY, False):
+            st.toast("Parool uuendatud. Oled sisse logitud.", icon="✅")
         return user
     # Guests have already bypassed the gate; don't re-render the form.
     if is_guest():
@@ -224,7 +649,9 @@ def render_login_gate() -> AuthUser | None:
             "Klikka seal lingile, et email kinnitada — seejärel saad allpool sisse logida."
         )
 
-    login_tab, signup_tab = st.tabs(["Logi sisse", "Loo uus konto"])
+    login_tab, signup_tab, reset_tab = st.tabs(
+        ["Logi sisse", "Loo uus konto", "Taasta parool"]
+    )
 
     with login_tab:
         with st.form("vorm_login_form"):
@@ -296,6 +723,39 @@ def render_login_gate() -> AuthUser | None:
                     return None
                 st.session_state[_PENDING_CONFIRM_KEY] = cleaned_email
                 st.rerun()
+
+    with reset_tab:
+        st.caption(
+            "Sisesta konto email. Saadame lingi, millega saad siin rakenduses "
+            "uue parooli määrata."
+        )
+        with st.form("vorm_reset_request_form"):
+            reset_email = st.text_input(
+                "Email", placeholder="sinu@email.ee", key="_vorm_reset_email",
+            )
+            submitted = st.form_submit_button(
+                "Saada taastamislink", type="primary", width="stretch"
+            )
+            if submitted:
+                cleaned_email = (reset_email or "").strip().lower()
+                if not cleaned_email:
+                    st.error("Email on kohustuslik.")
+                    return None
+                if "@" not in cleaned_email or "." not in cleaned_email.split("@")[-1]:
+                    st.error("Vigane email-aadress.")
+                    return None
+                try:
+                    request_password_reset(cleaned_email)
+                except SupabaseNotConfigured as exc:
+                    st.error(str(exc))
+                    return None
+                except Exception as exc:
+                    st.error(_humanize_auth_error(exc))
+                    return None
+                st.success(
+                    f"Kui konto on olemas, saatsime taastamislingi aadressile "
+                    f"**{cleaned_email}**."
+                )
 
     # Guest-mode escape hatch — useful for course-project demos and reviewers
     # who don't want to create an account just to poke at the UI.
