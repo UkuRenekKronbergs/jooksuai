@@ -23,7 +23,24 @@ except ImportError:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_ROOT / "data"
+
+
+def _is_source_checkout() -> bool:
+    """True when this module is imported from a checked-out repo (editable
+    install or `streamlit run` against the source tree). False when imported
+    from a wheel installed into site-packages — in that case PROJECT_ROOT
+    points inside the venv and is read-only on hosts like Streamlit Cloud.
+    """
+    return (PROJECT_ROOT / "pyproject.toml").is_file()
+
+
+if _is_source_checkout():
+    DATA_DIR = PROJECT_ROOT / "data"
+else:
+    # Streamlit Cloud / any installed-package deployment. `~` resolves to a
+    # writable per-user directory (`/home/adminuser` on Streamlit Cloud).
+    DATA_DIR = Path.home() / ".vorm"
+
 CACHE_DIR = DATA_DIR / "cache"
 USER_DIR = DATA_DIR / "user"
 
