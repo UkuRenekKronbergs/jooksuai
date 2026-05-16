@@ -21,7 +21,7 @@ Harrastus- ja poolprofessionaalsetel jooksjatel on palju andmeid (nutikell, GPS,
 - **Küsib LLM-ilt soovituse** neljas kategoorias (jätka / vähenda / taastumispäev / alternatiivne) koos 2–4-lauselise põhjendusega. Toetab 3 prompti-varianti A/B-testimiseks (`baseline` / `numeric` / `conservative`).
 - **Näitab** ACWR-kõverat, päevakoormust, nädalamahtu ja RPE-trendi Plotly-interaktiivgraafikutena.
 - **Retrospektiivne test** — vali mineviku kuupäev, näita mudeli soovitust nii, nagu see päev oleks olnud täna.
-- **Päeva-päeva kasutusslog** — pärast soovitust salvesta 1–5 hinnang kasulikkusele ja veenvusele, kas järgisid, ja järgmise treeningu enesetunne. Vajalik valideerimise §4.3 jaoks.
+- **Päevalogi** — pärast soovitust salvesta 1–5 hinnang kasulikkusele ja veenvusele, kas järgisid soovitust ning kuidas järgmine treening tundus. Vajalik valideerimise §4.3 jaoks.
 - **Treeningkava** — genereerib täieliku päev-haaval struktureeritud võistluse-ettevalmistuse kava (base → build → peak → taper), arvestades sinu praegust vormi ja tippaegu. CSV-eksport TrainingPeaksi-sõbralik.
 
 ## Kiire alustamine
@@ -83,7 +83,7 @@ src/vorm/
 ├── auth.py                  # Supabase email-OTP login + sidebar user panel
 ├── data/
 │   ├── models.py            # TrainingActivity, AthleteProfile, DailySubjective
-│   ├── storage.py           # Lokaalne SQLite vahemälu + päeva-logi (anon režiim)
+│   ├── storage.py           # Lokaalne SQLite vahemälu + päevalogi (anon režiim)
 │   ├── supabase_store.py    # Multi-user Supabase-store (profile + daily_log)
 │   ├── strava.py            # stravalib OAuth-klient + cache-teadlik delta-sync
 │   ├── garmin.py            # GPX-kaust fallback parser (§5 Risk 2)
@@ -143,7 +143,7 @@ Unit-testid katavad praegu (106 testi):
 - Strava delta-sync: külm/soe vahemälu, API tõrke fallback, mitte-jooks filtreering
 - Garmin GPX-parser: HR-aggregatsioon, mitte-jooksu filtreering, kaust-laadimine
 - ACWR-trend regressioon: tasakaalu trend, danger-crossing, müra-supressioon
-- Päeva-logi SQLite roundtrip + upsert + skaala-valideerimine
+- Päevalogi SQLite roundtrip + upsert + skaala-valideerimine
 
 CI töötab GitHub Actionsis iga push-i peal Python 3.11 ja 3.12 all.
 
@@ -153,7 +153,7 @@ Projekt valideeritakse nelja etapina (vt [PROJECT_PLAN.md](PROJECT_PLAN.md) jaot
 
 1. **Retrospektiivne test** 30 varasemal päeval (sh 5–7 teadaolevalt „kriitilist" päeva). Edu = ≥ 70% kattumist mu omaaegse otsusega.
 2. **Treeneri kõrvutus** 14 järjestikusel päeval (18.05 – 01.06). Treener Ille Kukk hindab samu sisendeid ilma mudeli väljundit nägemata.
-3. **Isiklik igapäevane kasutus** 14 päeva järjest — UI-s päeva-logi (`Päeva-logi` tab), kus iga päev login: kasulikkus (1–5), veenvus (1–5), kas järgisin, järgmise treeningu enesetunne (1–5).
+3. **Isiklik igapäevane kasutus** 14 päeva järjest — UI-s päevalogi (`Päevalogi` tab), kus iga päev login: kasulikkus (1–5), veenvus (1–5), kas järgisin ja järgmise treeningu enesetunne (1–5).
 4. **Kvalitatiivne intervjuu** 2 treeningkaaslasega projekti lõpus. Skript: [docs/interview_script.md](docs/interview_script.md) (6 pool-struktureeritud küsimust).
 
 ### Valideerimisharness
@@ -220,7 +220,7 @@ Cloud-režiimis vaikimisi andmeallikas on **Käsitsi lisamine** ja see on tühi.
 
 ### Cloud-spetsiifika
 
-- **Failisüsteem on efemeerne.** SQLite vahemälu (`data/cache/activities.sqlite`) kaob iga restardi peal — kuid sportlase profiil ja päeva-logi saab püsima jätta läbi **Supabase-režiimi** (vt allpool). Anonüümses režiimis (ilma Supabase'ita) ka päeva-logi efemeerne.
+- **Failisüsteem on efemeerne.** SQLite vahemälu (`data/cache/activities.sqlite`) kaob iga restardi peal — kuid sportlase profiil ja päevalogi saab püsima jätta läbi **Supabase-režiimi** (vt allpool). Anonüümses režiimis (ilma Supabase'ita) ka päevalogi efemeerne.
 - **App magab 7 päeva idle järel.** Esmase päringu cold-start ~30 s.
 - **Strava OAuth** — `scripts/strava_bootstrap.py` kasutab localhost:8000-i ega tööta cloud'is. Genereeri token lokaalselt, kleebi `STRAVA_REFRESH_TOKEN` Streamlit secrets'i.
 - **RAM ~1 GB.** Praegune sõltuvuste komplekt (Streamlit + pandas + scikit-learn) mahub ära ~400 MB peal.
@@ -239,7 +239,7 @@ Sama kood töötab mõlemas keskkonnas.
 Vaikimisi käivitub rakendus **anonüümses ühe-kasutaja režiimis** lokaalse SQLite'iga. Kui seadistad **Supabase'i** (URL + anon-võti), lülitub rakendus **multi-user režiimi**:
 
 - **Sisselogimine** email + parooliga. Esmakordsel registreerumisel saadab Supabase kinnitusmaili — pärast lingile klikkimist pole kinnitamist enam vaja, ainult email + parool.
-- **Sportlase profiil** ja **päeva-logi** salvestuvad pilve — säilivad redeploy'de vahel, näha igast seadmest. Profiil **salvestub automaatselt** kui väärtusi muudad.
+- **Sportlase profiil** ja **päevalogi** salvestuvad pilve — säilivad redeploy'de vahel, näha igast seadmest. Profiil **salvestub automaatselt** kui väärtusi muudad.
 - **Row-Level Security** — iga kasutaja näeb ainult enda andmeid; PostgreSQL võtab vastutuse, mitte rakenduse-kood.
 - **Strava-vahemälu** jääb endiselt lokaalseks SQLite'iks (see on per-deployment HTTP-cache, mitte kasutaja andmed).
 
@@ -266,7 +266,7 @@ Eemalda `SUPABASE_URL` ja `SUPABASE_ANON_KEY` env-ist või Streamlit secrets'ist
 
 - Treeningandmed (GPS-punktid, tooraine pulsiribaread) **ei** liigu LLM-pakkuja serverisse — LLM näeb ainult agregeeritud näitajaid ja metaandmeid.
 - Strava refresh token hoitakse lokaalses `.env`-failis (gitignored) või Streamlit secrets'is — mitte kunagi commit'is.
-- **Multi-user režiimis** (Supabase) — profiil + päeva-logi salvestub pilve, Row-Level Security tagab, et iga kasutaja näeb ainult enda andmeid. Anon-võti on disainilt avalik (kaitstud RLS-iga); `service_role` võtit rakendus ei kasuta.
+- **Multi-user režiimis** (Supabase) — profiil + päevalogi salvestub pilve, Row-Level Security tagab, et iga kasutaja näeb ainult enda andmeid. Anon-võti on disainilt avalik (kaitstud RLS-iga); `service_role` võtit rakendus ei kasuta.
 
 ## Vastutuspiir
 

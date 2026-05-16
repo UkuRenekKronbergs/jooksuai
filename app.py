@@ -384,23 +384,26 @@ def _render_daily_log_form(
     recommended_category: str,
     rationale: str | None,
 ) -> None:
-    """Project Plan §4.3 — collect the athlete's daily reaction to the rec."""
+    """Project Plan §4.3 — collect the athlete's reaction to the recommendation."""
     store = _get_user_store()
     existing = store.get_daily_log(log_day)
     with st.form(f"daily_log_{log_day.isoformat()}", clear_on_submit=False):
-        st.markdown(f"#### Päeva-logi — {log_day.isoformat()}")
+        st.markdown(f"#### Päevalogi — {log_day.isoformat()}")
         st.caption(
-            "Salvesta enda hinnang soovitusele. Annab valideerimisele §4.3 "
-            "vajaminevad andmed (kasulikkus, järgimine, järgmise treeningu enesetunne)."
+            "Salvesta, kui kasulik ja veenev soovitus oli ning kuidas esimene "
+            "järgmine treening pärast seda soovitust tundus. Kui järgmist trenni "
+            "pole veel olnud, jäta enesetunne keskele ja uuenda logi hiljem."
         )
         col1, col2 = st.columns(2)
         usefulness = col1.slider(
-            "Soovituse kasulikkus (1–5)", 1, 5,
+            "Kui kasulik soovitus oli? (1–5)", 1, 5,
             value=existing.usefulness if existing and existing.usefulness else 3,
+            help="1 = ei aidanud otsust teha, 3 = enam-vähem kasulik, 5 = väga kasulik.",
         )
         persuasiveness = col2.slider(
-            "Põhjenduse veenvus (1–5)", 1, 5,
+            "Kui veenev põhjendus oli? (1–5)", 1, 5,
             value=existing.persuasiveness if existing and existing.persuasiveness else 3,
+            help="1 = põhjendus ei veennud, 3 = arusaadav, 5 = väga selge ja usaldusväärne.",
         )
         followed_options = ["Jah", "Osaliselt", "Ei"]
         followed_default = (
@@ -411,17 +414,26 @@ def _render_daily_log_form(
             "Kas järgisid soovitust?", followed_options,
             index=followed_default, horizontal=True,
         )
+        st.caption(
+            "**Järgmise treeningu enesetunne** tähendab esimest trenni pärast seda "
+            "soovitust: kas läksid trenni värske ja kontrollitud tundega või olid "
+            "jalad rasked, väsimus suur või pidid trenni kärpima."
+        )
         next_feeling = st.slider(
-            "Järgmise treeningu enesetunne (1 = halb, 5 = väga hea)", 1, 5,
+            "Kuidas järgmine treening tundus? (1–5)", 1, 5,
             value=existing.next_session_feeling if existing and existing.next_session_feeling else 3,
+            help=(
+                "1 = väga halb / pidid katkestama või tugevalt kärpima, "
+                "3 = tavaline, 5 = väga hea / värske ja kontrollitud."
+            ),
         )
         notes = st.text_area(
             "Märkmed (valikuline)",
             value=existing.notes if existing else "",
-            placeholder="Nt: lõpetasin treeningu 15 min varem, jalg pinges.",
+            placeholder="Nt: järgmine trenn oli kerge ja kontrollitud; või jalad olid rasked ja kärpisin 15 min.",
             height=70,
         )
-        submitted = st.form_submit_button("💾 Salvesta päeva-logi", type="primary")
+        submitted = st.form_submit_button("💾 Salvesta päevalogi", type="primary")
         if submitted:
             followed_code = {"Jah": "yes", "Osaliselt": "partial", "Ei": "no"}[followed_label]
             store.save_daily_log(DailyLogEntry(
@@ -435,9 +447,9 @@ def _render_daily_log_form(
                 notes=notes.strip() or None,
             ))
             if existing:
-                st.success(f"Päeva-logi uuendatud ({log_day.isoformat()}).")
+                st.success(f"Päevalogi uuendatud ({log_day.isoformat()}).")
             else:
-                st.success(f"Päeva-logi salvestatud ({log_day.isoformat()}).")
+                st.success(f"Päevalogi salvestatud ({log_day.isoformat()}).")
 
 
 _WEEKDAY_ET = ["Esmaspäev", "Teisipäev", "Kolmapäev", "Neljapäev", "Reede", "Laupäev", "Pühapäev"]
@@ -665,7 +677,7 @@ daily_load = build_load_timeseries(activities, profile, end=analysis_date)
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     ["Tänane soovitus", "Koormuse ajalugu", "Tippajad",
-     "Retrospektiivne test", "Treeningkava", "Päeva-logi"]
+     "Retrospektiivne test", "Treeningkava", "Päevalogi"]
 )
 
 # --- Tab 1: today's recommendation
@@ -1077,17 +1089,17 @@ with tab5:
 # --- Tab 6: daily usage log history (Project Plan §4.3)
 with tab6:
     st.markdown(
-        "Päeva-päeva log: iga päeva, mil sa tööriista kasutad, hindad soovitust 1–5 "
-        "skaalal ning märgid, kas järgisid ja kuidas järgmine treening läks. Andmed "
-        "lähevad valideerimise §4.3 (isiklik igapäevane kasutus) analüüsi."
+        "Päevalogi kogub lühikese tagasiside iga kasutuskorra kohta: kui kasulik "
+        "soovitus oli, kas järgisid seda ning kuidas esimene järgmine treening pärast "
+        "soovitust tundus. Need andmed lähevad valideerimise §4.3 analüüsi."
     )
 
     log_store = _get_user_store()
     logs = log_store.list_daily_logs()
     if not logs:
         st.info(
-            "Päeva-logisid pole veel. Mine **Tänane soovitus**-tabi, vajuta "
-            "_Hinda koormust_ ja täida päeva-logi vorm."
+            "Päevalogisid pole veel. Mine **Tänane soovitus**-tabi, vajuta "
+            "_Hinda koormust_ ja täida päevalogi vorm."
         )
     else:
         followed_map = {"yes": "Jah", "partial": "Osaliselt", "no": "Ei", None: "—"}
@@ -1098,7 +1110,7 @@ with tab6:
                 "Kasulikkus": e.usefulness if e.usefulness else "—",
                 "Veenvus": e.persuasiveness if e.persuasiveness else "—",
                 "Järgisin": followed_map.get(e.followed, "—"),
-                "Järgmise treeningu tunne": e.next_session_feeling if e.next_session_feeling else "—",
+                "Järgmise treeningu enesetunne": e.next_session_feeling if e.next_session_feeling else "—",
                 "Märkmed": (e.notes or "")[:80],
             }
             for e in logs
@@ -1131,6 +1143,7 @@ with tab6:
         if feel:
             st.caption(
                 f"Järgmise treeningu enesetunde keskmine: **{sum(feel) / len(feel):.1f}/5** "
+                "(1 = väga halb, 3 = tavaline, 5 = väga hea) "
                 f"(n={len(feel)} päeva)"
             )
 
