@@ -268,7 +268,10 @@ def _surface_auth_hash_params() -> None:
 })();
 </script>
         """,
-        height=0,
+        # `st.iframe` rejects height=0 (must be a positive int, "content", or
+        # "stretch"). 1 px is the smallest legal value and keeps the bridge
+        # effectively invisible.
+        height=1,
     )
 
 
