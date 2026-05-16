@@ -130,7 +130,7 @@ CI töötab GitHub Actionsis iga push-i peal Python 3.11 ja 3.12 all.
 Projekt valideeritakse kolmes etapis (vt [PROJECT_PLAN.md](PROJECT_PLAN.md) jaotis 4):
 
 1. **Retrospektiivne test** 30 varasemal päeval (sh 5–7 teadaolevalt „kriitilist" päeva). Edu = ≥ 70% kattumist mu omaaegse otsusega.
-2. **Treeneri kõrvutus** 14 järjestikusel päeval (18.05 – 01.06). Treener Ardi Vann hindab samu sisendeid ilma mudeli väljundit nägemata.
+2. **Treeneri kõrvutus** 14 järjestikusel päeval (18.05 – 01.06). Treener Ille Kukk hindab samu sisendeid ilma mudeli väljundit nägemata.
 3. **Kvalitatiivne intervjuu** 2 treeningkaaslasega projekti lõpus.
 
 ## Privaatsus
