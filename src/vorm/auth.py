@@ -33,6 +33,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import streamlit as st
 
 from .config import load_config
+from .data.models import UserRole
 from .data.supabase_store import SupabaseNotConfigured, SupabaseStore
 
 if TYPE_CHECKING:
@@ -49,6 +50,7 @@ class AuthUser:
 
 _CLIENT_KEY = "_vorm_supabase_client"
 _USER_KEY = "_vorm_auth_user"
+_ROLE_CACHE_KEY = "_vorm_auth_user_role"
 _PENDING_CONFIRM_KEY = "_vorm_auth_pending_confirm_email"
 _PASSWORD_RECOVERY_KEY = "_vorm_password_recovery_active"
 _PASSWORD_RESET_DONE_KEY = "_vorm_password_reset_done"
@@ -415,16 +417,25 @@ def _restore_persistent_session() -> AuthUser | None:
     return user
 
 
-def sign_up(email: str, password: str) -> bool:
+def sign_up(email: str, password: str, role: str = "athlete") -> bool:
     """Create a new account. Supabase sends a confirm-email link.
 
-    Does NOT sign the user in — they must click the confirmation link first.
-    Returns True when the signup call succeeded (regardless of whether email
-    confirmation is required). Raises on actual failures (existing user,
-    weak password, network errors).
+    The chosen ``role`` (``"athlete"`` or ``"coach"``) is stored in Supabase
+    ``raw_user_meta_data`` so the *first* sign-in after email-confirmation
+    can bootstrap the ``user_roles`` row — even if confirmation happens in
+    a different browser session.
+
+    Does NOT sign the user in. Returns True on success; raises on auth API
+    errors (existing user, weak password, network).
     """
+    if role not in ("athlete", "coach"):
+        raise ValueError(f"role must be 'athlete' or 'coach', got {role!r}")
     client = _get_client()
-    client.auth.sign_up({"email": email, "password": password})
+    client.auth.sign_up({
+        "email": email,
+        "password": password,
+        "options": {"data": {"requested_role": role}},
+    })
     return True
 
 
@@ -541,6 +552,7 @@ def sign_out() -> None:
             pass
     for key in (
         _USER_KEY,
+        _ROLE_CACHE_KEY,
         _PENDING_CONFIRM_KEY,
         _PASSWORD_RECOVERY_KEY,
         _PASSWORD_RESET_DONE_KEY,
@@ -561,6 +573,82 @@ def get_store() -> SupabaseStore | None:
     client = _get_client()
     _bind_session(client, user)
     return SupabaseStore(client=client, user_id=user.id)
+
+
+def get_store_for(target_user_id: str) -> SupabaseStore | None:
+    """Coach-mode store: act on a *different* user's rows under the current JWT.
+
+    The bound JWT is still the coach's — RLS lets the coach read the linked
+    athlete's profile/daily_logs and read+write coach_decisions where
+    ``user_id == target_user_id``. Construct with the *athlete's* user_id so
+    queries naturally target their rows.
+    """
+    user = current_user()
+    if not user:
+        return None
+    client = _get_client()
+    _bind_session(client, user)
+    return SupabaseStore(client=client, user_id=target_user_id)
+
+
+def current_user_role() -> UserRole | None:
+    """Resolve the signed-in user's role, bootstrapping it on first sign-in.
+
+    Cached in ``st.session_state`` to avoid hitting the DB on every rerun.
+    When the ``user_roles`` row is missing (very first sign-in after
+    confirmation), reads ``raw_user_meta_data.requested_role`` from the
+    Supabase user and writes the row with that value — falling back to
+    ``"athlete"`` if the signup metadata is missing.
+    """
+    user = current_user()
+    if not user:
+        return None
+    cached = st.session_state.get(_ROLE_CACHE_KEY)
+    if isinstance(cached, UserRole):
+        return cached
+
+    client = _get_client()
+    _bind_session(client, user)
+    store = SupabaseStore(client=client, user_id=user.id)
+    try:
+        role = store.get_role()
+    except Exception:
+        return None
+    if role is None:
+        requested = _read_requested_role_from_metadata(client) or "athlete"
+        try:
+            role = store.set_role(requested)
+        except Exception:
+            return None
+    st.session_state[_ROLE_CACHE_KEY] = role
+    return role
+
+
+def _read_requested_role_from_metadata(client: Client) -> str | None:
+    """Read ``requested_role`` from Supabase user metadata, if any."""
+    try:
+        resp = client.auth.get_user()
+    except Exception:
+        return None
+    auth_user_obj = getattr(resp, "user", None)
+    if auth_user_obj is None:
+        return None
+    meta = getattr(auth_user_obj, "user_metadata", None) or {}
+    if not isinstance(meta, dict):
+        return None
+    value = meta.get("requested_role")
+    if value in ("athlete", "coach"):
+        return value
+    return None
+
+
+def invalidate_role_cache() -> None:
+    """Drop the cached role; next ``current_user_role()`` re-fetches it.
+
+    Call after the coach sets / changes their ``display_name`` so the new
+    value is visible in the same session.
+    """
+    st.session_state.pop(_ROLE_CACHE_KEY, None)
 
 
 def _humanize_auth_error(exc: Exception) -> str:
@@ -740,6 +828,17 @@ def render_login_gate() -> AuthUser | None:
                 type="password",
                 key="_vorm_signup_password_confirm",
             )
+            role_label = st.radio(
+                "Kes sa Vorm.ai-s oled?",
+                options=("Sportlane", "Treener"),
+                horizontal=True,
+                key="_vorm_signup_role",
+                help=(
+                    "Sportlane: logib treeningud, näeb iga päeva soovitust. "
+                    "Treener: ühendub kutsekoodiga sportlastega ja näeb "
+                    "nende koormust + sisestab pimemenetluses päevaotsuseid."
+                ),
+            )
             submitted = st.form_submit_button(
                 "Loo konto", type="primary", width="stretch"
             )
@@ -757,8 +856,9 @@ def render_login_gate() -> AuthUser | None:
                 if len(new_password) < 6:
                     st.error("Parool peab olema vähemalt 6 märki.")
                     return None
+                chosen_role = "coach" if role_label == "Treener" else "athlete"
                 try:
-                    sign_up(cleaned_email, new_password)
+                    sign_up(cleaned_email, new_password, role=chosen_role)
                 except SupabaseNotConfigured as exc:
                     st.error(str(exc))
                     return None

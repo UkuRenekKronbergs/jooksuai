@@ -57,16 +57,18 @@ from vorm.metrics import (
 )
 from vorm.planning import PlanGenerationError, PlanGoal, generate_training_plan
 from vorm.rules import evaluate_safety_rules
-from vorm.validation import build_validation_report
 from vorm.ui import (
     acwr_chart,
     apply_theme,
     daily_load_chart,
     fitness_form_chart,
     hr_zone_distribution_chart,
+    list_linked_coach_names,
     log_heatmap_chart,
     longest_streak,
     pb_progression_chart,
+    render_athlete_coach_panel,
+    render_coach_home,
     render_fitness_form_explainer,
     render_load_metrics_explainer,
     render_onboarding_wizard,
@@ -76,6 +78,7 @@ from vorm.ui import (
     streak_count,
     weekly_volume_chart,
 )
+from vorm.validation import build_validation_report
 
 if __name__ == "__main__" and not st.runtime.exists():
     from streamlit.web import cli as stcli
@@ -872,6 +875,30 @@ if cfg.has_supabase:
     if auth_user is None and not auth.is_guest():
         st.stop()
 
+# Coach-mode short-circuit: when the signed-in user's role is 'coach',
+# replace the standard athlete-tab UI with the coach dashboard. Coaches
+# don't have their own activity/profile data — they read linked athletes'
+# rows through Row-Level Security policies in Supabase.
+if auth_user and not auth.is_guest():
+    user_role = auth.current_user_role()
+    if user_role and user_role.role == "coach":
+        st.sidebar.title("🏃 Vorm.ai")
+        st.sidebar.caption("AI-põhine treeningkoormuse analüüsija")
+        auth.render_sidebar_user_panel()
+        st.sidebar.divider()
+        render_theme_selector(container=st.sidebar)
+
+        coach_store = auth.get_store()
+        if coach_store is None:
+            st.error("Sisselogimine on katki. Logi sisse uuesti.")
+            st.stop()
+
+        render_coach_home(
+            coach_store,
+            build_athlete_store=auth.get_store_for,
+        )
+        st.stop()
+
 # Onboarding wizard: shown once when a signed-in user has no saved profile.
 # Skipped for guests and anonymous-mode runs — both already work with sample
 # defaults and don't have a place to persist what the wizard would capture.
@@ -898,6 +925,15 @@ st.sidebar.caption("AI-põhine treeningkoormuse analüüsija")
 if auth_user or auth.is_guest():
     auth.render_sidebar_user_panel()
     st.sidebar.divider()
+
+# Athlete-side coach link panel: lets athletes paste a coach's invite code
+# and see which coach(es) are currently linked. Only renders for signed-in
+# athletes (coaches have their own dashboard; guests / anon mode skip).
+if auth_user and not auth.is_guest():
+    _athlete_store = auth.get_store()
+    if _athlete_store is not None:
+        render_athlete_coach_panel(_athlete_store)
+        st.sidebar.divider()
 
 _consume_strava_oauth_callback()
 strava_connection = _load_saved_strava_connection(cfg)
@@ -1671,6 +1707,23 @@ with tab7:
     )
 
     coach_store = _get_user_store()
+
+    # If the athlete is linked to coaches, tell them their coach can enter
+    # decisions directly — the local form is then a fallback for in-person
+    # interview transcription (or when the coach isn't on Vorm.ai).
+    if coach_store is not None and auth_user and not auth.is_guest():
+        try:
+            linked_coach_names = list_linked_coach_names(coach_store)
+        except Exception:
+            linked_coach_names = []
+        if linked_coach_names:
+            names_str = ", ".join(f"**{n}**" for n in linked_coach_names)
+            st.success(
+                f"🧑‍🏫 Sinuga on seotud: {names_str}. Tema otsused ilmuvad "
+                "siia tabelisse automaatselt — alloleva vormi saad jätta "
+                "kasutamata, välja arvatud juhul, kui transkribeerid intervjuust."
+            )
+
     existing_logs = coach_store.list_daily_logs()
     try:
         existing_decisions = coach_store.list_coach_decisions()

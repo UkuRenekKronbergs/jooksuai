@@ -5,21 +5,41 @@ Strava OAuth connection metadata when Supabase credentials are configured.
 Each method requires an authenticated `user_id`; Row-Level Security policies
 enforce per-user isolation at the database level (see `docs/supabase_schema.sql`).
 
+In multi-tenant mode, a *coach* user can read a linked athlete's profile +
+daily_logs and read/write that athlete's coach_decisions — the RLS policies
+allow this when `coach_athlete_links` has an active link between the coach
+(``auth.uid()``) and the row's ``user_id``. The cleanest way to query as a
+coach is to construct a fresh ``SupabaseStore`` with ``user_id=athlete_id``
+while the bound JWT is still the coach's: RLS handles authorization.
+
 The Strava activity delta-sync cache continues to use local SQLite files —
 that's an HTTP cache, not the authoritative user connection.
 """
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
-from .models import AthleteProfile, StravaConnection
+from .models import AthleteProfile, CoachAthleteLink, StravaConnection, UserRole
 from .storage import CoachDecision, DailyLogEntry
 
 if TYPE_CHECKING:
     from supabase import Client
+
+
+# 32-char alphabet: A-Z+2-9 minus ambiguous chars (I/L/O/0/1). 8 chars give
+# 32**8 ≈ 1.1e12 combinations — plenty for course-project scale where there
+# are <100 coaches. Unique constraint on invite_code surfaces collisions.
+_INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+_INVITE_CODE_LENGTH = 8
+
+
+def generate_invite_code() -> str:
+    """Generate an 8-char alphanumeric invite code (no ambiguous chars)."""
+    return "".join(secrets.choice(_INVITE_ALPHABET) for _ in range(_INVITE_CODE_LENGTH))
 
 
 class SupabaseNotConfigured(RuntimeError):
@@ -216,6 +236,142 @@ class SupabaseStore:
             .execute()
         )
 
+    # --- User role (athlete vs coach) ------------------------------------
+
+    def get_role(self) -> UserRole | None:
+        """Fetch this user's role + display name. None if not yet set."""
+        resp = (
+            self.client.table("user_roles")
+            .select("role, display_name")
+            .eq("user_id", self.user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            return None
+        return UserRole(
+            role=rows[0]["role"],
+            display_name=rows[0].get("display_name") or "",
+        )
+
+    def set_role(self, role: str, display_name: str = "") -> UserRole:
+        """Upsert the user's role. Returns the saved value."""
+        if role not in ("athlete", "coach"):
+            raise ValueError(f"role must be 'athlete' or 'coach', got {role!r}")
+        payload = {
+            "user_id": self.user_id,
+            "role": role,
+            "display_name": display_name or "",
+        }
+        self.client.table("user_roles").upsert(
+            payload, on_conflict="user_id"
+        ).execute()
+        return UserRole(role=role, display_name=display_name or "")
+
+    # --- Coach ↔ athlete links --------------------------------------------
+
+    def create_invite(self) -> CoachAthleteLink:
+        """Coach creates a new invite code. Returns the pending link.
+
+        ``athlete_user_id`` stays NULL until the athlete claims the code via
+        ``accept_invite``. RLS lets only the inviting coach see this row.
+        """
+        code = generate_invite_code()
+        payload: dict[str, Any] = {
+            "coach_user_id": self.user_id,
+            "athlete_user_id": None,
+            "invite_code": code,
+            "status": "pending",
+        }
+        resp = (
+            self.client.table("coach_athlete_links")
+            .insert(payload)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            raise RuntimeError("Kutse loomine ebaõnnestus (puudub vastusrida).")
+        return _row_to_link(rows[0])
+
+    def list_coach_links(
+        self, *, statuses: tuple[str, ...] = ("pending", "active"),
+    ) -> list[CoachAthleteLink]:
+        """All links where the current user is the coach side, filtered by status."""
+        q = (
+            self.client.table("coach_athlete_links")
+            .select("*")
+            .eq("coach_user_id", self.user_id)
+        )
+        if statuses:
+            q = q.in_("status", list(statuses))
+        resp = q.order("created_at", desc=False).execute()
+        return [_row_to_link(r) for r in (resp.data or [])]
+
+    def list_athlete_links(
+        self, *, statuses: tuple[str, ...] = ("active",),
+    ) -> list[CoachAthleteLink]:
+        """All links where the current user is the athlete side, filtered by status."""
+        q = (
+            self.client.table("coach_athlete_links")
+            .select("*")
+            .eq("athlete_user_id", self.user_id)
+        )
+        if statuses:
+            q = q.in_("status", list(statuses))
+        resp = q.order("accepted_at", desc=False).execute()
+        return [_row_to_link(r) for r in (resp.data or [])]
+
+    def accept_invite(self, code: str) -> CoachAthleteLink:
+        """Athlete claims a coach's pending invite code.
+
+        Updates the matching pending row in-place. RLS enforces:
+        - row must be `pending` with NULL athlete_user_id (otherwise the
+          UPDATE matches no rows)
+        - new athlete_user_id must equal auth.uid()
+        """
+        cleaned = (code or "").strip().upper()
+        if not cleaned:
+            raise ValueError("Kutsekood on kohustuslik.")
+        resp = (
+            self.client.table("coach_athlete_links")
+            .update({
+                "athlete_user_id": self.user_id,
+                "status": "active",
+                "accepted_at": datetime.now(UTC).isoformat(),
+            })
+            .eq("invite_code", cleaned)
+            .eq("status", "pending")
+            .is_("athlete_user_id", "null")
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            raise LookupError(
+                "Kutsekood ei kehti või on juba kasutatud. Küsi treenerilt uut koodi."
+            )
+        return _row_to_link(rows[0])
+
+    def revoke_link(self, link_id: str) -> None:
+        """Coach marks a link as revoked. Sportlane kaotab seetõttu juurdepääsu."""
+        (
+            self.client.table("coach_athlete_links")
+            .update({"status": "revoked"})
+            .eq("id", link_id)
+            .eq("coach_user_id", self.user_id)
+            .execute()
+        )
+
+    def delete_link(self, link_id: str) -> None:
+        """Hard-delete a link the current user owns as coach."""
+        (
+            self.client.table("coach_athlete_links")
+            .delete()
+            .eq("id", link_id)
+            .eq("coach_user_id", self.user_id)
+            .execute()
+        )
+
 
 def _row_to_profile(row: dict[str, Any]) -> AthleteProfile:
     return AthleteProfile(
@@ -262,6 +418,27 @@ def _row_to_daily_log(row: dict[str, Any]) -> DailyLogEntry:
         next_session_feeling=row.get("next_session_feeling"),
         notes=row.get("notes"),
         created_at=created_at,
+    )
+
+
+def _parse_optional_iso_datetime(raw: Any) -> datetime | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _row_to_link(row: dict[str, Any]) -> CoachAthleteLink:
+    return CoachAthleteLink(
+        id=row["id"],
+        coach_user_id=row["coach_user_id"],
+        athlete_user_id=row.get("athlete_user_id"),
+        invite_code=row["invite_code"],
+        status=row["status"],
+        created_at=_parse_optional_iso_datetime(row.get("created_at")),
+        accepted_at=_parse_optional_iso_datetime(row.get("accepted_at")),
     )
 
 

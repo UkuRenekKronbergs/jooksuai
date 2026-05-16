@@ -3,16 +3,166 @@
 -- Käivita see üks kord:
 --   Supabase Dashboard → SQL Editor → New query → kleebi sisu → Run.
 --
--- Loob neli kasutaja-skoobiga tabelit:
---   - athlete_profiles  — sportlase profiil (üks rida per kasutaja)
---   - daily_logs        — päeva-logi (Project Plan §4.3, üks rida per kasutaja+kuupäev)
---   - strava_connections — kasutaja Strava OAuth seos (üks rida per kasutaja)
---   - coach_decisions   — treeneri pimemenetluses tehtud päevaotsused (§4.2)
+-- Loob kuus kasutaja-skoobiga tabelit:
+--   - user_roles          — sportlane vs treener (üks rida per kasutaja)
+--   - coach_athlete_links — treener ↔ sportlane seos (kutsekoodiga)
+--   - athlete_profiles    — sportlase profiil (üks rida per sportlane)
+--   - daily_logs          — päeva-logi (Project Plan §4.3, üks rida per kasutaja+kuupäev)
+--   - strava_connections  — kasutaja Strava OAuth seos (üks rida per kasutaja)
+--   - coach_decisions     — treeneri pimemenetluses tehtud päevaotsused (§4.2)
 --
--- Mõlemal on Row-Level Security sees: iga kasutaja näeb / muudab AINULT
--- enda ridu, isegi kui keegi peaks anon-võtmega päringuid manipuleerima.
+-- Row-Level Security on igal tabelil sees: iga kasutaja näeb/muudab AINULT
+-- enda ridu. Treener näeb LISAKS oma seotud sportlaste profiili, päevalogi
+-- ja coach_decisions ridu (read + kirjuta coach_decisions-i jaoks).
 --
 -- Skript on idempotentne — võid uuesti käivitada, ilma andmeid kaotamata.
+
+-- ===== user_roles ====================================================
+-- Iga konto on kas 'athlete' (sportlane) või 'coach' (treener).
+-- Treenerid ei oma athlete_profiles rida — nad seovad end coach_athlete_links
+-- kaudu sportlastega ja näevad sportlaste andmeid läbi nende seoste.
+CREATE TABLE IF NOT EXISTS public.user_roles (
+    user_id      UUID        PRIMARY KEY
+                             REFERENCES auth.users(id)
+                             ON DELETE CASCADE,
+    role         TEXT        NOT NULL DEFAULT 'athlete'
+                             CHECK (role IN ('athlete', 'coach')),
+    display_name TEXT        NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE public.user_roles ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users select own role" ON public.user_roles;
+DROP POLICY IF EXISTS "Users insert own role" ON public.user_roles;
+DROP POLICY IF EXISTS "Users update own role" ON public.user_roles;
+DROP POLICY IF EXISTS "Users delete own role" ON public.user_roles;
+
+CREATE POLICY "Users select own role" ON public.user_roles
+    FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users insert own role" ON public.user_roles
+    FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users update own role" ON public.user_roles
+    FOR UPDATE USING (auth.uid() = user_id)
+                WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users delete own role" ON public.user_roles
+    FOR DELETE USING (auth.uid() = user_id);
+
+-- NB: kaks ristkooslast poliisi (treener näeb sportlase rolli, sportlane
+-- näeb treeneri rolli) on defineeritud allpool, pärast coach_athlete_links
+-- tabeli ja is_active_coach_of() funktsiooni loomist — muidu CREATE POLICY
+-- viskaks "relation does not exist" vea.
+
+-- Olemasolevad kasutajad → vaikimisi sportlasteks (et juba registreerunud
+-- testkasutajad ei jääks rollideta). ON CONFLICT hoiab idempotentseks.
+INSERT INTO public.user_roles (user_id, role)
+SELECT id, 'athlete' FROM auth.users
+ON CONFLICT (user_id) DO NOTHING;
+
+
+-- ===== coach_athlete_links ============================================
+-- Treener loob kutsekoodi (athlete_user_id = NULL, status = 'pending').
+-- Sportlane sisestab koodi → row uuendub: athlete_user_id = tema id,
+-- status = 'active'. Üks (treener, sportlane) paar on unikaalne, aga
+-- sportlasel võib olla mitu treenerit ja vastupidi.
+CREATE TABLE IF NOT EXISTS public.coach_athlete_links (
+    id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    coach_user_id    UUID        NOT NULL
+                                 REFERENCES auth.users(id) ON DELETE CASCADE,
+    athlete_user_id  UUID        REFERENCES auth.users(id) ON DELETE CASCADE,
+    invite_code      TEXT        NOT NULL UNIQUE,
+    status           TEXT        NOT NULL DEFAULT 'pending'
+                                 CHECK (status IN ('pending', 'active', 'revoked')),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    accepted_at      TIMESTAMPTZ,
+    UNIQUE (coach_user_id, athlete_user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_links_coach ON public.coach_athlete_links (coach_user_id);
+CREATE INDEX IF NOT EXISTS idx_links_athlete ON public.coach_athlete_links (athlete_user_id);
+
+ALTER TABLE public.coach_athlete_links ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Links select coach side" ON public.coach_athlete_links;
+DROP POLICY IF EXISTS "Links select athlete side" ON public.coach_athlete_links;
+DROP POLICY IF EXISTS "Links select pending by code" ON public.coach_athlete_links;
+DROP POLICY IF EXISTS "Links insert by coach" ON public.coach_athlete_links;
+DROP POLICY IF EXISTS "Links accept by athlete" ON public.coach_athlete_links;
+DROP POLICY IF EXISTS "Links update by coach" ON public.coach_athlete_links;
+DROP POLICY IF EXISTS "Links delete by coach" ON public.coach_athlete_links;
+
+-- Treener näeb enda loodud seoseid.
+CREATE POLICY "Links select coach side" ON public.coach_athlete_links
+    FOR SELECT USING (auth.uid() = coach_user_id);
+-- Sportlane näeb seoseid, mis tema kontot puudutavad.
+CREATE POLICY "Links select athlete side" ON public.coach_athlete_links
+    FOR SELECT USING (auth.uid() = athlete_user_id);
+-- Treener loob seose (athlete_user_id = NULL invite-vormis).
+CREATE POLICY "Links insert by coach" ON public.coach_athlete_links
+    FOR INSERT WITH CHECK (auth.uid() = coach_user_id);
+-- Sportlane aktsepteerib kutset: USING-kontroll filtreerib ridu, mida ta
+-- üldse 'näha' tohib (pending + vaba); WITH CHECK kindlustab, et ta saab
+-- ainult enda id-le linkida ja 'active'-staatusesse viia.
+CREATE POLICY "Links accept by athlete" ON public.coach_athlete_links
+    FOR UPDATE
+    USING (status = 'pending' AND athlete_user_id IS NULL)
+    WITH CHECK (athlete_user_id = auth.uid() AND status = 'active');
+-- Treener saab oma seose tühistada (status='revoked') või kustutada.
+CREATE POLICY "Links update by coach" ON public.coach_athlete_links
+    FOR UPDATE USING (auth.uid() = coach_user_id)
+                WITH CHECK (auth.uid() = coach_user_id);
+CREATE POLICY "Links delete by coach" ON public.coach_athlete_links
+    FOR DELETE USING (auth.uid() = coach_user_id);
+
+
+-- ===== is_active_coach_of() ===========================================
+-- Helper: tagastab TRUE, kui auth.uid() on aktiivne treener antud
+-- sportlasele. Kasutame seda teiste tabelite RLS-poliisides, et treener
+-- näeks ainult seotud sportlaste andmeid. SECURITY DEFINER on vajalik,
+-- sest muidu coach_athlete_links-i enda RLS blokeeriks lookup'i, kui
+-- seda kasutatakse teise tabeli policy-kontekstis.
+CREATE OR REPLACE FUNCTION public.is_active_coach_of(p_athlete_user_id UUID)
+RETURNS BOOLEAN
+LANGUAGE SQL
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.coach_athlete_links
+        WHERE coach_user_id = auth.uid()
+          AND athlete_user_id = p_athlete_user_id
+          AND status = 'active'
+    );
+$$;
+
+GRANT EXECUTE ON FUNCTION public.is_active_coach_of(UUID) TO authenticated;
+
+
+-- ===== user_roles ristkooslased poliisid =============================
+-- Need defineeritakse alles nüüd, sest need viitavad coach_athlete_links
+-- tabelile ja is_active_coach_of() funktsioonile, mille olemasolu
+-- CREATE POLICY kontrollib defineerimishetkel.
+
+-- Sportlane näeb oma seotud treeneri rolli/display_name'i, et UI saaks
+-- kuvada "Treener: Ille Kukk" UUIDi asemel.
+DROP POLICY IF EXISTS "Athletes select coach role" ON public.user_roles;
+CREATE POLICY "Athletes select coach role" ON public.user_roles
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.coach_athlete_links
+            WHERE athlete_user_id = auth.uid()
+              AND coach_user_id = user_roles.user_id
+              AND status = 'active'
+        )
+    );
+
+-- Treener näeb oma seotud sportlase rolli (peamiselt mugavus, kasutab
+-- juba olemasolevat is_active_coach_of() helperit).
+DROP POLICY IF EXISTS "Coaches select athlete role" ON public.user_roles;
+CREATE POLICY "Coaches select athlete role" ON public.user_roles
+    FOR SELECT USING (public.is_active_coach_of(user_id));
+
 
 -- ===== athlete_profiles ==============================================
 CREATE TABLE IF NOT EXISTS public.athlete_profiles (
@@ -49,6 +199,11 @@ CREATE POLICY "Users update own profile" ON public.athlete_profiles
 CREATE POLICY "Users delete own profile" ON public.athlete_profiles
     FOR DELETE USING (auth.uid() = user_id);
 
+-- Treener näeb seotud sportlase profiili (read-only).
+DROP POLICY IF EXISTS "Coaches select linked athlete profile" ON public.athlete_profiles;
+CREATE POLICY "Coaches select linked athlete profile" ON public.athlete_profiles
+    FOR SELECT USING (public.is_active_coach_of(user_id));
+
 -- Hoia updated_at jooksvalt värske.
 CREATE OR REPLACE FUNCTION public.tg_set_updated_at()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -61,6 +216,11 @@ $$;
 DROP TRIGGER IF EXISTS trg_profiles_updated_at ON public.athlete_profiles;
 CREATE TRIGGER trg_profiles_updated_at
     BEFORE UPDATE ON public.athlete_profiles
+    FOR EACH ROW EXECUTE FUNCTION public.tg_set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_user_roles_updated_at ON public.user_roles;
+CREATE TRIGGER trg_user_roles_updated_at
+    BEFORE UPDATE ON public.user_roles
     FOR EACH ROW EXECUTE FUNCTION public.tg_set_updated_at();
 
 
@@ -139,6 +299,11 @@ CREATE POLICY "Users update own logs" ON public.daily_logs
 CREATE POLICY "Users delete own logs" ON public.daily_logs
     FOR DELETE USING (auth.uid() = user_id);
 
+-- Treener näeb seotud sportlase päevalogi (read-only).
+DROP POLICY IF EXISTS "Coaches select linked athlete logs" ON public.daily_logs;
+CREATE POLICY "Coaches select linked athlete logs" ON public.daily_logs
+    FOR SELECT USING (public.is_active_coach_of(user_id));
+
 
 -- ===== coach_decisions ================================================
 -- §4.2 valideerimisetapp: treener sisestab oma päevaotsuse Vorm.ai-st
@@ -176,3 +341,20 @@ CREATE POLICY "Users update own coach decisions" ON public.coach_decisions
                 WITH CHECK (auth.uid() = user_id);
 CREATE POLICY "Users delete own coach decisions" ON public.coach_decisions
     FOR DELETE USING (auth.uid() = user_id);
+
+-- Treener saab seotud sportlase päevaotsuseid lugeda, lisada ja muuta —
+-- §4.2 pimemenetluses sisestab treener oma otsuse otse sportlase
+-- konteksti (varem tegi seda sportlane ise ümberkirjutajana).
+DROP POLICY IF EXISTS "Coaches select linked athlete decisions" ON public.coach_decisions;
+DROP POLICY IF EXISTS "Coaches insert linked athlete decisions" ON public.coach_decisions;
+DROP POLICY IF EXISTS "Coaches update linked athlete decisions" ON public.coach_decisions;
+DROP POLICY IF EXISTS "Coaches delete linked athlete decisions" ON public.coach_decisions;
+CREATE POLICY "Coaches select linked athlete decisions" ON public.coach_decisions
+    FOR SELECT USING (public.is_active_coach_of(user_id));
+CREATE POLICY "Coaches insert linked athlete decisions" ON public.coach_decisions
+    FOR INSERT WITH CHECK (public.is_active_coach_of(user_id));
+CREATE POLICY "Coaches update linked athlete decisions" ON public.coach_decisions
+    FOR UPDATE USING (public.is_active_coach_of(user_id))
+                WITH CHECK (public.is_active_coach_of(user_id));
+CREATE POLICY "Coaches delete linked athlete decisions" ON public.coach_decisions
+    FOR DELETE USING (public.is_active_coach_of(user_id));

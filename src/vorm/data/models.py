@@ -7,7 +7,7 @@ Intentionally simple dataclasses rather than Pydantic — the boundary conversio
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 
 
 @dataclass(frozen=True)
@@ -87,6 +87,38 @@ class AthleteProfile:
             if pace:
                 return round(pace * multiplier, 3)
         return None
+
+
+@dataclass(frozen=True)
+class UserRole:
+    """Vorm.ai konto roll: kas sportlane või treener.
+
+    Treener ei oma athlete_profile rida — tema andmed (sportlaste loend,
+    nende profiilid + päevalogid) tulevad coach_athlete_links seoste kaudu.
+    ``display_name`` on UI-s näidatav nimi (treenerile eelkõige tähtis,
+    sest sportlasele kuvatakse ta seda nime saates).
+    """
+
+    role: str  # 'athlete' | 'coach'
+    display_name: str = ""
+
+
+@dataclass(frozen=True)
+class CoachAthleteLink:
+    """Treener ↔ sportlane seos kutsekoodi kaudu.
+
+    Eluts: ``pending`` (treener lõi koodi, sportlane pole veel sisestanud)
+    → ``active`` (sportlane sisestas koodi, andmed on jagatud) → ``revoked``
+    (treener tühistas seose).
+    """
+
+    id: str
+    coach_user_id: str
+    athlete_user_id: str | None
+    invite_code: str
+    status: str  # 'pending' | 'active' | 'revoked'
+    created_at: datetime | None = None
+    accepted_at: datetime | None = None
 
 
 def _distance_meters(key: str) -> int:
